@@ -123,7 +123,7 @@ describe("resolveCteColumnHoverColumn 的溯源接线", () => {
 describe("QueryEditor Ctrl+点击的 CTE 跳转接线", () => {
   it("CTE 分支排在本地表缓存之前", () => {
     const cteBranch = positionOf("const cteModel = getEditorSemanticModel(doc, pos, currentView.state);");
-    const localTableCache = positionOf("// 1. Local table cache (sync). Relation column lists always prefer tables over routines.");
+    const localTableCache = positionOf("// 1. Local table lookup with the resolved scope");
 
     expect(source).toContain("// 0. CTE (WITH ... AS) in-editor navigation");
     expect(cteBranch).toBeLessThan(localTableCache);
@@ -147,7 +147,7 @@ describe("QueryEditor Ctrl+点击的 CTE 跳转接线", () => {
   it("解析失败只告警，不阻断后续表/列跳转", () => {
     expect(source).toContain('console.warn("[DBX] CTE ctrl+click resolution failed:", error);');
 
-    const cteBlock = source.slice(positionOf("const cteModel = getEditorSemanticModel(doc, pos, currentView.state);"), positionOf("// 1. Local table cache"));
+    const cteBlock = source.slice(positionOf("const cteModel = getEditorSemanticModel(doc, pos, currentView.state);"), positionOf("// 1. Local table lookup with the resolved scope"));
     // 两个成功分支各自提前 return；catch 分支只能 warn，否则会吞掉原有的表/列跳转。
     expect(cteBlock.match(/return;/g) ?? []).toHaveLength(2);
     expect(cteBlock).not.toMatch(/catch \(error\) \{[\s\S]*?return/);
