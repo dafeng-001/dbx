@@ -90,7 +90,15 @@ import { buildSqlSemanticModel } from "@/lib/sql/semantic/model";
 import { findCteColumnResolution, findCteReferenceAt, resolveCteColumnOrigins, type CteColumnOrigin } from "@/lib/sql/semantic/cteNavigation";
 import type { SqlSemanticModel, SqlSemanticRowSource } from "@/lib/sql/semantic/types";
 import { mergeSqlSemanticReferenceAnalysis, resolveSqlSemanticNavigationTarget } from "@/lib/sql/semantic/references";
-import { buildElasticsearchCompletionItemsFromContext, getElasticsearchCompletionContext, getElasticsearchCompletionResultValidFor, shouldAutoOpenElasticsearchCompletion, type ElasticsearchCompletionItem } from "@/lib/elasticsearch/elasticsearchCompletion";
+import {
+  buildElasticsearchCompletionItemsFromContext,
+  elasticsearchCompletionNeedsFields,
+  getElasticsearchCompletionContext,
+  getElasticsearchCompletionResultValidFor,
+  shouldAutoOpenElasticsearchCompletion,
+  type ElasticsearchCompletionField,
+  type ElasticsearchCompletionItem,
+} from "@/lib/elasticsearch/elasticsearchCompletion";
 import { buildMongoCompletionItemsFromContext, getMongoCompletionContext, getMongoCompletionResultValidFor, mongoCompletionNeedsCollections, mongoCompletionNeedsFields, shouldAutoOpenMongoCompletion, type MongoCompletionItem } from "@/lib/mongo/mongoCompletion";
 import {
   buildSqlServerUseDatabaseCompletionItems,
@@ -4632,9 +4640,11 @@ function shouldApplyCompletionAsSnippet(item: QueryCompletionItem): boolean {
 function completionOptionForItem(item: QueryCompletionItem | BatchColumnSelectionActionItem) {
   const filterText = "filterText" in item && typeof item.filterText === "string" ? item.filterText : undefined;
   const labelPresentation = completionLabelPresentation(item.label, filterText);
+  const sortText = "sortText" in item && typeof item.sortText === "string" ? item.sortText : labelPresentation.sortText;
   if (isBatchColumnSelectionAction(item)) {
     return {
       ...labelPresentation,
+      ...(sortText ? { sortText } : {}),
       dbxBatchColumnSelectionAction: { sessionKey: item.sessionKey },
       type: item.type,
       detail: item.detail,
@@ -4651,6 +4661,7 @@ function completionOptionForItem(item: QueryCompletionItem | BatchColumnSelectio
   if (shouldApplyCompletionAsSnippet(item) && item.apply) {
     const completion = codeMirrorSnippetCompletion(item.apply, {
       ...labelPresentation,
+      ...(sortText ? { sortText } : {}),
       type: item.type,
       detail: item.detail,
       info: item.info,
@@ -4684,6 +4695,7 @@ function completionOptionForItem(item: QueryCompletionItem | BatchColumnSelectio
   }
   return cacheBatchColumnSelectionOption(batchColumnSelection, {
     ...labelPresentation,
+    ...(sortText ? { sortText } : {}),
     ...(batchColumnSelection ? { dbxBatchColumnSelection: batchColumnSelection } : {}),
     type: item.type,
     detail: item.detail,
@@ -4718,6 +4730,7 @@ async function provideElasticsearchCompletions(currentState: import("@codemirror
 
   const completionContext = getElasticsearchCompletionContext(fullDoc, position);
   let indices: string[] = [];
+  let fields: ElasticsearchCompletionField[] = [];
   if (props.database != null && completionContext.mode === "path") {
     try {
       indices = await connectionStore.listElasticsearchCompletionIndices(props.connectionId, props.database);
@@ -4725,9 +4738,16 @@ async function provideElasticsearchCompletions(currentState: import("@codemirror
       indices = [];
     }
   }
+  if (elasticsearchCompletionNeedsFields(completionContext) && completionContext.index) {
+    try {
+      fields = await connectionStore.listElasticsearchCompletionFields(props.connectionId, completionContext.index);
+    } catch {
+      fields = [];
+    }
+  }
   if (epoch !== completionEpoch) return null;
 
-  const items = buildElasticsearchCompletionItemsFromContext(completionContext, { indices });
+  const items = buildElasticsearchCompletionItemsFromContext(completionContext, { indices, fields });
   return buildCompletionResult(items, completionContext.from, getElasticsearchCompletionResultValidFor());
 }
 
