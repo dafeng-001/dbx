@@ -82,14 +82,15 @@ test("native Rust driver caches exclude failed build artifacts", () => {
 test("Rust test jobs install pinned nextest and retain separate doctests", () => {
   const pluginDevHost = readFileSync(new URL("../workflows/plugin-dev-host.yml", import.meta.url), "utf8");
   const pluginRelease = readFileSync(new URL("../workflows/plugin-cli-release.yml", import.meta.url), "utf8");
-  const consumers = [job("rust-test"), job("agent-rust"), job("agent-integration"),
+  const consumers = [job("packages"), job("rust-test"), job("agent-rust"), job("agent-integration"),
     job("test", pluginDevHost), job("prepare", pluginRelease)];
   for (const content of consumers) {
     assert.ok(content.includes("uses: taiki-e/install-action@9114bf4d891761788c546334fd37538eae1bf8b3"));
     assert.ok(content.includes("tool: cargo-nextest@0.9.137"));
     assert.doesNotMatch(content, /cargo test (?!.*--doc)/);
     const testCommand = content.indexOf("cargo nextest run") >= 0 ? "cargo nextest run"
-      : content.includes("ci-rust.mjs test") ? "ci-rust.mjs test" : "ci-agent-integration.sh";
+      : content.includes("pnpm test:packages") ? "pnpm test:packages"
+        : content.includes("ci-rust.mjs test") ? "ci-rust.mjs test" : "ci-agent-integration.sh";
     assert.ok(content.indexOf("tool: cargo-nextest@0.9.137") < content.indexOf(testCommand));
   }
   assert.ok(job("rust-test").includes('ci-rust.mjs doctest "$RUST_TEST_GROUP" "$RUST_FEATURE_MODE"'));
@@ -121,7 +122,7 @@ test("DuckDB Windows builds persist Rust and C++ compiler results", () => {
   assert.ok(content.includes('version: "v0.16.0"'));
 });
 
-test("standard Windows compatibility checks run separately with sccache", () => {
+test("Windows compatibility jobs cache Rust compilation without wrapping C or C++", () => {
   assert.ok(job("changes").includes("'vendor/webview2-com-sys/**'"));
   const standard = job("windows-standard-check");
   assert.ok(standard.includes("needs.changes.outputs.windows_win7_bundle == 'true'"));
@@ -134,7 +135,12 @@ test("standard Windows compatibility checks run separately with sccache", () => 
   assert.ok(standard.includes("sccache --show-stats"));
 
   const win7 = job("windows-win7-bundle");
-  assert.doesNotMatch(win7, /x86_64-pc-windows-msvc|Setup Rust for standard Windows|RUSTC_WRAPPER: sccache/);
+  assert.doesNotMatch(win7, /x86_64-pc-windows-msvc|Setup Rust for standard Windows/);
+  for (const setting of ["RUSTC_WRAPPER: sccache", 'SCCACHE_GHA_ENABLED: "true"',
+    "SCCACHE_GHA_VERSION: win7-webview2-1.0.902.49-v1", 'SCCACHE_IDLE_TIMEOUT: "0"']) assert.ok(win7.includes(setting));
+  assert.ok(win7.includes("fc920bf0ec8de6ee65d409111f7ec508035751ba"));
+  assert.ok(win7.includes('version: "v0.16.0"'));
+  assert.doesNotMatch(win7, /^\s+(?:CC|CXX):/m);
 });
 
 test("the planner uses the exact event base and preserves a single workflow cancellation scope", () => {
