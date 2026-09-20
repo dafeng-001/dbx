@@ -19,7 +19,7 @@ const VECTOR_DB_TYPES: ReadonlySet<DatabaseType> = new Set([
   "milvus",
   "weaviate",
   "chromadb",
-  // If modifying this, also update is_vector_db() in crates/dbx-core/src/agent_tools.rs.
+  // If modifying this, also update is_vector_db() in crates/dbx-core/src/ai/agent_tools.rs.
 ]);
 
 export function isVectorDbType(dbType: DatabaseType): boolean {
@@ -818,6 +818,17 @@ export function resolveAiNamespaceSelection(tab: QueryTab, connection: Connectio
     return { kind: "schema", value: tab.schema?.trim() || "" };
   }
   return { kind: "database", value: tab.database || "" };
+}
+
+/**
+ * Database that `@` table mentions are listed from and resolved against. It has
+ * to match the request database (`selectedDatabases[0] ?? tab.database`), so a
+ * database picked in the composer wins over the query tab's own database.
+ */
+export function resolveAiMentionDatabase(tab: QueryTab, connection: ConnectionConfig, selectedDatabases: string[]): string {
+  const namespace = resolveAiNamespaceSelection(tab, connection);
+  if (namespace.kind !== "database") return tab.database || "";
+  return selectedDatabases[0] ?? tab.database ?? "";
 }
 
 export function resolveDefaultAiSchema(connection: ConnectionConfig, schemaOptions: string[]): string | undefined {

@@ -93,16 +93,16 @@ describe("resolveCteColumnHoverColumn 的溯源接线", () => {
     expect(body).toContain("await ensureColumnsForTable(reference, reference);");
     expect(body).toContain("const columns = cachedColumnsByTable.get(completionCacheKey(reference));");
     expect(body).toContain("candidate.name.toLowerCase() === origin.column.toLowerCase()");
-    expect(body).toContain("return matched[0] ?? null;");
+    expect(body).toContain("return matched.find((column) => column != null) ?? null;");
   });
 
-  it("多星号产生的多个来源按顺序逐个取元数据，第一个命中者胜出", () => {
+  it("多星号产生的多个来源并发取元数据，顺序即优先级，第一个命中者胜出", () => {
     const body = functionBody("resolveCteColumnHoverColumn");
 
     // 顺序即优先级：谁先取到真实列元数据就用谁（歧义 SQL 的裁决点就在这里）。
-    expect(body).toContain("for (const origin of origins) {");
-    expect(body).toContain("if (column) matched.push(column);");
-    expect(body.indexOf("for (const origin of origins) {")).toBeLessThan(body.indexOf("return matched[0] ?? null;"));
+    expect(body).toContain("origins.map(async (origin) => {");
+    expect(body).toContain("?? null;");
+    expect(body.indexOf("origins.map(async (origin) => {")).toBeLessThan(body.indexOf("return matched.find((column) => column != null) ?? null;"));
 
     // 第二个来源直接复用第一个来源已建好的缓存，不会重复发起元数据查询。
     expect(body).toContain("cachedColumnsByTable.get(completionCacheKey(reference))");

@@ -17,7 +17,7 @@ import { ExternalSqlFileTooLargeError } from "@/lib/sql/sqlFileOpen";
 import { appendDebugLog, isDebugLoggingEnabled } from "@/lib/backend/debugLog";
 import { decodeMeilisearchDocumentPage, decodeMeilisearchSearchResult, type MeilisearchDocumentPage, type MeilisearchDocumentPageWire, type MeilisearchSearchResult, type MeilisearchSearchWireResult } from "@/lib/backend/meilisearchTransport";
 import type { XuguTablespaceInfo } from "@/types/database";
-import type { CreatedKey, EnqueuedTaskSummary, KeyCreateInput, KeyListItem, KeyPage, KeyUpdateInput, MeilisearchSystemOverview, MeilisearchTask, TaskListInput, TaskPage, TaskSelector } from "@/types/meilisearchManagement";
+import type { CreatedKey, EnqueuedTaskSummary, KeyCreateInput, KeyListItem, KeyPage, KeyUpdateInput, MeilisearchCreateIndexInput, MeilisearchSystemOverview, MeilisearchTask, TaskListInput, TaskPage, TaskSelector } from "@/types/meilisearchManagement";
 import type { CsvQuoteMode } from "@/lib/export/csvQuoteMode";
 import type { SqlInsertMode } from "@/lib/export/sqlInsertMode";
 
@@ -101,6 +101,7 @@ import type {
   PluginRollbackResult,
   PluginTrustedKey,
   PluginUiAssetPayload,
+  TableVGroupLayout,
 } from "@/types/database";
 import type {
   DataGridColumnDistinctValuesSqlOptions,
@@ -206,6 +207,17 @@ export interface AgentOfflineExportResult {
 export interface AgentOfflineImportResult {
   count: number;
   jreCount: number;
+  /** Items the package could not install; the rest of the import still ran. */
+  failures: AgentOfflineImportFailure[];
+}
+
+export interface AgentOfflineImportFailure {
+  /** Managed JRE key (e.g. "21") or driver key (e.g. "oracle"). */
+  key: string;
+  /** True when the failed item is a managed JRE runtime rather than a driver. */
+  is_jre: boolean;
+  /** Failure text, including the underlying OS error when there is one. */
+  error: string;
 }
 
 export type JavaRuntimeMode = "managed" | "system" | "custom";
@@ -426,6 +438,7 @@ export interface QueryPaginationExecutionPlan {
   countSql?: string;
   exactQueryRowBound?: number;
   useAgentResultSession: boolean;
+  paginationRowNumberColumn?: string;
 }
 
 export type QuerySortDirection = "asc" | "desc";
@@ -789,6 +802,19 @@ export async function saveEditorSettings(settings: unknown): Promise<void> {
   return invoke("save_editor_settings", { settings });
 }
 
+export interface GlobalSearchSettings {
+  roots: string[];
+  extensions: string[];
+}
+
+export function loadGlobalSearchSettings(): Promise<GlobalSearchSettings | null> {
+  return invoke("load_global_search_settings");
+}
+
+export function saveGlobalSearchSettings(settings: GlobalSearchSettings): Promise<void> {
+  return invoke("save_global_search_settings", { settings });
+}
+
 export interface BackgroundImageInfo {
   storedPath: string;
   fileName: string;
@@ -1077,6 +1103,31 @@ export async function renameSqlFileInFolder(rootPath: string, filePath: string, 
 
 export async function deleteSqlFileInFolder(rootPath: string, filePath: string): Promise<void> {
   return invoke("delete_sql_file_in_folder", { rootPath, filePath });
+}
+
+export interface GlobalSearchRequest {
+  roots: string[];
+  query: string;
+  extensions?: string[];
+  caseSensitive?: boolean;
+  useRegex?: boolean;
+  wholeWord?: boolean;
+  limit?: number;
+}
+
+export interface GlobalSearchMatch {
+  path: string;
+  fileName: string;
+  /** 1-based line number. */
+  line: number;
+  /** 1-based char column within the line (for CodeMirror). */
+  column: number;
+  matchText: string;
+  lineText: string;
+}
+
+export async function globalSearch(request: GlobalSearchRequest): Promise<GlobalSearchMatch[]> {
+  return invoke("global_search", { request });
 }
 
 // --- AI Conversations ---
@@ -2624,6 +2675,18 @@ export async function saveSidebarLayout(layout: import("@/types/database").Sideb
 
 export async function loadSidebarLayout(): Promise<import("@/types/database").SidebarLayout | null> {
   return invoke("load_sidebar_layout");
+}
+
+export async function saveTableVGroups(scopeKey: string, layout: TableVGroupLayout): Promise<void> {
+  return invoke("save_table_vgroups", { scopeKey, layout });
+}
+
+export async function loadTableVGroups(): Promise<Record<string, import("@/types/database").TableVGroupLayout>> {
+  return invoke("load_table_vgroups");
+}
+
+export async function deleteTableVGroupsForConnection(connectionId: string): Promise<void> {
+  return invoke("delete_table_vgroups_for_connection", { connectionId });
 }
 
 // --- Updates ---
@@ -4446,6 +4509,22 @@ export async function documentUpdateDocument(connectionId: string, database: str
   });
 }
 
+export async function mongoExplainFind(connectionId: string, database: string, collection: string, options: { skip: number; limit: number; filter?: string; projection?: string; sort?: string; collation?: string; verbosity?: string }, executionId?: string): Promise<unknown> {
+  return invoke<unknown>("mongo_explain_find", {
+    connectionId,
+    database,
+    collection,
+    skip: options.skip,
+    limit: options.limit,
+    filter: options.filter,
+    projection: options.projection,
+    sort: options.sort,
+    collation: options.collation,
+    verbosity: options.verbosity,
+    executionId,
+  });
+}
+
 export async function mongoBulkWrite(connectionId: string, database: string, collection: string, operationsJson: string, optionsJson?: string): Promise<MongoBulkWriteResult> {
   return invoke<MongoBulkWriteResult>("mongo_bulk_write", {
     connectionId,
@@ -4584,6 +4663,10 @@ export async function meilisearchGetIndexOverview(connectionId: string, index: s
     connectionId,
     index,
   });
+}
+
+export async function meilisearchCreateIndex(connectionId: string, input: MeilisearchCreateIndexInput): Promise<void> {
+  return invoke("meilisearch_create_index", { connectionId, input });
 }
 
 export async function meilisearchDeleteIndex(connectionId: string, index: string): Promise<void> {

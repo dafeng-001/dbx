@@ -403,6 +403,8 @@ export interface PluginConnectionProviderContribution {
   filesystem_provider?: string;
   capabilities?: PluginConnectionCapability[];
   actions?: PluginConnectionActionContribution[];
+  /** Multi-endpoint providers (Kafka advertised.listeners) receive a SOCKS5 runtime.proxy route over transport layers. */
+  proxy_route?: boolean;
 }
 
 export interface PluginWorkbenchContribution {
@@ -469,6 +471,16 @@ export interface PluginResultViewContribution {
   description?: string;
   icon?: string;
 }
+
+/**
+ * Contribution types the host renders through the plugin's own UI entrypoint in
+ * a plugin tab. A `workbench` is launched from the sidebar, the plugin center,
+ * or `host.openWorkbench`; a `result-view` is launched from the query-result
+ * toolbar with the current result snapshot as context. Both declare display
+ * metadata only — the opened contribution id is what tells the plugin UI which
+ * of its declared surfaces to render.
+ */
+export type PluginUiContribution = PluginWorkbenchContribution | PluginResultViewContribution;
 
 export type PluginContribution = PluginConnectionProviderContribution | PluginWorkbenchContribution | PluginFilesystemProviderContribution | PluginContextMenuContribution | PluginResultViewContribution;
 
@@ -1339,6 +1351,7 @@ export type TreeNodeType =
   | "group-table-partitions"
   | "group-table-subpartitions"
   | "group-tables"
+  | "table-vgroup"
   | "group-dolt-system-tables"
   | "group-views"
   | "group-materialized-views"
@@ -1413,6 +1426,16 @@ export interface SidebarLayout {
   order: SidebarOrderEntry[];
 }
 
+export type TableVGroupOrderEntry = { type: "group"; id: string; children?: TableVGroupOrderEntry[] } | { type: "table"; name: string };
+
+export interface TableVGroupLayout {
+  version?: number;
+  groups: ConnectionGroup[];
+  order: TableVGroupOrderEntry[];
+  /** Toggled by the container context menu to hide groups without deleting them. */
+  enabled?: boolean;
+}
+
 export interface TreeNode {
   id: string;
   label: string;
@@ -1468,6 +1491,8 @@ export interface TreeNode {
   tableSearchParentId?: string;
   savedSqlId?: string;
   savedSqlFolderId?: string;
+  /** Set on synthetic table virtual-group container nodes. */
+  vgroupId?: string;
   meta?: ColumnInfo | IndexInfo | ForeignKeyInfo | TriggerInfo | ConstraintInfo | PartitionInfo | SubpartitionInfo | ExtensionInfo | VectorCollectionMeta | MongoCollectionMeta | CustomTypeTreeMemberMeta;
   loadMore?: {
     parentId: string;
@@ -1499,6 +1524,9 @@ export interface TableStructureEditorDraft {
   activeTab: TableInfoTab;
   /** DDL as loaded from the database — the baseline `ddlDraft` is compared against. */
   ddlContent?: string;
+  /** Original DDL and display preference retained so restoring a draft cannot change its baseline. */
+  rawDdlContent?: string;
+  excludeDdlStorage?: boolean;
   /** Edited DDL script, or null/undefined when the DDL tab was left untouched. */
   ddlDraft?: string | null;
   newTableName: string;
@@ -1581,6 +1609,11 @@ export interface QueryTab {
   forceWordWrap?: boolean;
   connectionId: string;
   database: string;
+  /**
+   * 所属连接被删除后，被保留下来的 SQL 页签会记录原连接名。新建同名连接时按此
+   * 字段把页签重新绑定到新连接上；绑定完成后清空。
+   */
+  detachedConnectionName?: string;
   /** Optional branch context for a driver-profile database workspace. */
   workspaceBranch?: string;
   schema?: string;
@@ -1656,6 +1689,12 @@ export interface QueryTab {
   editorSelection?: {
     anchor: number;
     head: number;
+  };
+  /** Ephemeral request to move the cursor/scrolling to a specific line/column (e.g. global content search jump). */
+  editorRevealRequest?: {
+    id: number;
+    line: number;
+    column?: number;
   };
   executionId?: string;
   /** Ephemeral result run targeted by the current execution; null means a new run is being produced. */
@@ -1764,6 +1803,8 @@ export interface QueryTab {
    */
   sourceLoad?: {
     startedAt: number;
+    /** Whether this request should open an editable object definition instead of the original source. */
+    initialEditing?: boolean;
     /** 加载失败时写入；保留 request 以便就地重试 */
     error?: string;
     /**
@@ -1786,6 +1827,8 @@ export interface QueryTab {
     database?: string;
     columns: ColumnInfo[];
     primaryKeys: string[];
+    /** Physical primary keys used for table-open default sorting; excludes unique and synthetic row identifiers. */
+    physicalPrimaryKeys?: string[];
   };
   tableMetaUpdatedAt?: number;
   /** 该 tab 的 tableMeta 是哪个连接元数据代次下写入的：disconnect / 关闭数据库 /

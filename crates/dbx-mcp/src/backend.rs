@@ -10,6 +10,7 @@ use dbx_core::{
     agent_tools::{self, format_query_result_as_text, AgentSqlPermissions, QueryCellWindow},
     connection::{connection_configs_pool_equivalent, AppState},
     db::{mongo_driver::MongoIndexSpec, redis_driver::RedisCommandResult, ColumnInfo, TableInfo},
+    history::HistoryEntry,
     mcp_policy::{connection_group_paths, McpConnectionGroupPath},
     models::connection::{ConnectionConfig, DatabaseType},
     storage::{DesktopSettings, McpGlobalPolicy, McpGlobalPolicyState, Storage},
@@ -180,6 +181,10 @@ pub trait DbxBackend: Send + Sync {
     async fn load_mcp_global_policy(&self) -> Result<McpGlobalPolicy, String>;
 
     async fn load_connections(&self) -> Result<Vec<ConnectionConfig>, String>;
+    async fn save_history_entry(&self, entry: &HistoryEntry) -> Result<(), String> {
+        let _ = entry;
+        Err("Query history is not supported by this backend.".to_string())
+    }
     /// Return database names visible to the DBX connection itself. The MCP
     /// server applies its own database-scope policy before exposing these
     /// names to a client.
@@ -582,7 +587,12 @@ impl LocalBackend {
     }
 
     pub async fn open(path: &Path) -> Result<Self, String> {
-        Self::open_with_app_version(path, env!("CARGO_PKG_VERSION")).await
+        // The standalone MCP binary and CLI are versioned independently from
+        // the DBX app, so their crate version must not stand in for the app
+        // version during plugin `engines.dbx` checks: a plugin requiring
+        // DBX >= 0.5.68 would be rejected against e.g. 0.4.90 (#9595). An
+        // empty version makes the compatibility check skip that requirement.
+        Self::open_with_app_version(path, "").await
     }
 
     /// Same as [`open`], but lets tests and embedded callers pin the app version
@@ -767,6 +777,10 @@ impl DbxBackend for LocalBackend {
         // and a manual MCP reload is needed to recover).
         self.sync_runtime_configs(&configs).await;
         Ok(configs)
+    }
+
+    async fn save_history_entry(&self, entry: &HistoryEntry) -> Result<(), String> {
+        self.state.storage.save_history_entry(entry).await
     }
 
     async fn list_databases(&self, connection: &ConnectionConfig) -> Result<Vec<String>, String> {
@@ -1105,6 +1119,11 @@ impl DbxBackend for WebBackend {
             .map_err(|error| format!("Invalid connection list response: {error}"))
     }
 
+    async fn save_history_entry(&self, entry: &HistoryEntry) -> Result<(), String> {
+        self.request(reqwest::Method::POST, "/api/history/save", Some(json!({ "entry": entry }))).await?;
+        Ok(())
+    }
+
     async fn list_databases(&self, connection: &ConnectionConfig) -> Result<Vec<String>, String> {
         self.ensure_connected(connection).await?;
         match connection.db_type {
@@ -1212,8 +1231,17 @@ impl DbxBackend for WebBackend {
                 }
             }
 
-            let max_rows = arguments.get("limit").and_then(Value::as_u64).unwrap_or(100) as usize;
-            let mut body = json!({ "connectionId": connection.id, "database": database, "sql": sql });
+            // Clamp here too: the Web backend does not go through the in-process
+            // `execute_tool` clamp, so an unclamped value would bypass the
+            // published max_rows ceiling. `maxRows` also bounds how many rows the
+            // route fetches, not just how many are rendered.
+            let max_rows = arguments
+                .get("limit")
+                .and_then(Value::as_u64)
+                .unwrap_or(100)
+                .clamp(1, agent_tools::MAX_EXECUTE_QUERY_ROWS as u64) as usize;
+            let mut body =
+                json!({ "connectionId": connection.id, "database": database, "sql": sql, "maxRows": max_rows });
             // Stateful MCP sessions pin every query to the same backend pool.
             if let Some(client_session_id) = arguments.get("client_session_id").and_then(Value::as_str) {
                 body["clientSessionId"] = json!(client_session_id);
@@ -1638,6 +1666,9 @@ impl DbxBackend for WebBackend {
         self.ensure_connected(connection).await?;
         let connection_id = &connection.id;
         match command {
+            MongoCommand::InDatabase { database, command } => {
+                Box::pin(self.execute_mongo_command(connection, database, command)).await
+            }
             MongoCommand::Version => {
                 let version: String = self
                     .request(
@@ -2019,6 +2050,20 @@ impl DbxBackend for WebBackend {
                     })
                     .collect::<Vec<_>>();
                 Ok(mongo_drop_indexes_query_result(dropped_names, failures, affected_rows_from_value(&value)))
+            }
+            MongoCommand::RenameCollection { collection, new_name } => {
+                self.request(
+                    reqwest::Method::POST,
+                    "/api/mongo/rename-collection",
+                    Some(json!({
+                        "connectionId": connection_id,
+                        "database": database,
+                        "collection": collection,
+                        "newName": new_name,
+                    })),
+                )
+                .await?;
+                Ok(scalar_query_result("renamed", Value::String(format!("{collection} -> {new_name}"))))
             }
             MongoCommand::DropCollection { collection } => {
                 self.request(
@@ -2669,14 +2714,16 @@ mod tests {
         assert_eq!(request_line, "POST /api/query/execute HTTP/1.1");
         let request: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(request["timeoutSecs"], 60);
+        assert_eq!(request["maxRows"], 10);
 
-        // Policy argument 300 overrides the connection.
+        // Policy argument 300 overrides the connection; maxRows is clamped to the
+        // published ceiling instead of being forwarded as-is.
         let result = backend
             .execute_agent_tool(
                 &connection,
                 "postgres",
                 "execute_query",
-                json!({ "sql": "SELECT 1", "limit": 10, "timeout_secs": 300 }),
+                json!({ "sql": "SELECT 1", "limit": 100000, "timeout_secs": 300 }),
                 AgentSqlPermissions { allow_writes: false, allow_dangerous: false, confirmed_write_sql: None },
             )
             .await;
@@ -2686,6 +2733,7 @@ mod tests {
         let (_request_line, second_body) = request_receiver.recv().unwrap();
         let second_request: Value = serde_json::from_str(&second_body).unwrap();
         assert_eq!(second_request["timeoutSecs"], 300);
+        assert_eq!(second_request["maxRows"], agent_tools::MAX_EXECUTE_QUERY_ROWS);
     }
 
     #[cfg(feature = "mq-admin")]
@@ -3783,6 +3831,43 @@ mod tests {
         let backend = LocalBackend::open(&database_path).await.unwrap();
 
         assert_eq!(backend.state().agent_manager.base_dir(), &agent_dir);
+    }
+
+    #[tokio::test]
+    async fn local_backend_standalone_open_skips_plugin_dbx_engine_gate() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let database_path = data_dir.path().join("dbx.db");
+        let plugin_dir = data_dir.path().join("plugins").join("io.dbx.gated");
+        std::fs::create_dir_all(plugin_dir.join("ui")).unwrap();
+        std::fs::write(plugin_dir.join("ui").join("index.html"), "<!doctype html>").unwrap();
+        std::fs::write(
+            plugin_dir.join("manifest.json"),
+            r#"{
+                "manifest_version": 1,
+                "id": "io.dbx.gated",
+                "name": "Gated",
+                "version": "1.0.0",
+                "publisher": "example",
+                "engines": { "dbx": ">=999.0.0", "host_api": "^1.0" },
+                "entrypoints": { "ui": { "root": "ui", "entry": "ui/index.html" } },
+                "permissions": ["host.events"]
+            }"#,
+        )
+        .unwrap();
+        let storage = Storage::open(&database_path).await.unwrap();
+        drop(storage);
+
+        // The standalone host has no app version to compare against (#9595).
+        let backend = LocalBackend::open(&database_path).await.unwrap();
+        let installed = backend.state().plugins.list_installed().unwrap();
+        let plugin = installed.iter().find(|plugin| plugin.manifest.id == "io.dbx.gated").unwrap();
+        assert!(plugin.compatibility.compatible, "{:?}", plugin.compatibility.errors);
+
+        // A host that knows the app version keeps enforcing the requirement.
+        let backend = LocalBackend::open_with_app_version(&database_path, "0.6.16").await.unwrap();
+        let installed = backend.state().plugins.list_installed().unwrap();
+        let plugin = installed.iter().find(|plugin| plugin.manifest.id == "io.dbx.gated").unwrap();
+        assert!(!plugin.compatibility.compatible, "{:?}", plugin.compatibility.errors);
     }
 
     #[test]

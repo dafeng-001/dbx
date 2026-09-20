@@ -21,6 +21,7 @@ import { fetchSqlFileTargetOptions } from "@/composables/useDatabaseOptions";
 import { requiresSqlFileTargetDatabaseSelection, supportsConnectionLevelDatabaseBootstrap } from "@/lib/connection/connectionLevelDatabaseBootstrap";
 import { cancelSqlFileExecution, executeSqlFiles, inspectSqlFileTables, listenSqlFileProgress, previewSqlFile, type SqlFilePreview, type SqlFileProgress, type SqlFileStatus, type SqlFileTable } from "@/lib/backend/api";
 import { buildDisplayFileNames, tooltipText as computeTooltipText } from "./sqlFilePreviewLabel";
+import { parseSqlFilePathInput } from "./sqlFilePathInput";
 import SqlFileProgressIndicator from "./SqlFileProgressIndicator.vue";
 import { useExportTracker, type ExportTask } from "@/composables/useExportTracker";
 import { translateBackendError } from "@/i18n/backend-errors";
@@ -73,6 +74,32 @@ const filePathDisplay = computed(() => {
   if (isDesktopRuntime) return previews.value.map((item) => item.filePath).join("; ");
   return previews.value.map((item) => displayFileNames.value.get(item.filePath) ?? item.fileName).join("; ");
 });
+
+// Desktop only: the path input is editable so a path can be pasted instead of
+// browsing. The draft follows the loaded previews and is committed on Enter/blur.
+const pathInput = ref("");
+watch(filePathDisplay, (value) => (pathInput.value = value), { immediate: true });
+
+async function commitPathInput() {
+  if (!isDesktopRuntime || running.value || selectingFile.value || loadingPreview.value) return;
+  const paths = parseSqlFilePathInput(pathInput.value);
+  if (paths.length === 0 || paths.join("; ") === filePathDisplay.value) {
+    pathInput.value = filePathDisplay.value;
+    return;
+  }
+  const typed = pathInput.value;
+  await loadPreviews(paths);
+  // Failed load: keep what was typed so the path can be corrected.
+  pathInput.value = previews.value.length > 0 ? filePathDisplay.value : typed;
+}
+
+// Ignore the Enter that confirms an IME composition (e.g. Chinese paths) so it
+// does not commit a half-typed path; only a real Enter commits.
+function commitPathInputOnEnter(event: KeyboardEvent) {
+  if (event.isComposing) return;
+  event.preventDefault();
+  void commitPathInput();
+}
 
 // Desktop tooltip shows the real file path; Web tooltip shows the user-facing
 // label only — never the server temp path (which contains a meaningless UUID).
@@ -134,14 +161,23 @@ function resetPerFileState() {
 }
 
 const sqlConnections = computed(() => store.connections.filter((c) => !["redis", "mongodb", "elasticsearch", "easysearch", "meilisearch", "qdrant", "milvus", "weaviate", "chromadb", "etcd", "zookeeper", "consul", "mq", "nacos"].includes(c.db_type)));
-// Mirrors the core executor gate (`supports_connection_level_database_bootstrap_target`): the
-// MySQL-family types it runs for, so the constraint toggle appears wherever the backend honors it.
+// Mirrors the core executor gate (`relational_constraint_bypass_kind` in
+// sql_file_import.rs): MySQL-family types use the session-scoped
+// FOREIGN_KEY_CHECKS toggle, PostgreSQL-family types use DISABLE/ENABLE
+// TRIGGER ALL, and SQL Server uses NOCHECK/CHECK CONSTRAINT ALL. The toggle
+// appears wherever the backend implements one of those mechanisms.
 const MYSQL_BOOTSTRAP_IMPORT_TYPES = new Set(["mysql", "doris", "starrocks", "goldendb"]);
 const MYSQL_BOOTSTRAP_IMPORT_PROFILES = new Set(["mariadb", "tidb", "oceanbase", "custom_mysql", "doris", "starrocks", "selectdb", "goldendb"]);
+const POSTGRES_CONSTRAINT_BYPASS_TYPES = new Set(["postgres", "gaussdb", "opengauss"]);
 const isMysqlCompatibleTarget = computed(() => {
   const config = store.getConfig(connectionId.value);
   if (!config) return false;
   return MYSQL_BOOTSTRAP_IMPORT_TYPES.has(config.db_type) || (!!config.driver_profile && MYSQL_BOOTSTRAP_IMPORT_PROFILES.has(config.driver_profile.toLowerCase()));
+});
+const supportsRelationalConstraintBypass = computed(() => {
+  const config = store.getConfig(connectionId.value);
+  if (!config) return false;
+  return isMysqlCompatibleTarget.value || POSTGRES_CONSTRAINT_BYPASS_TYPES.has(config.db_type) || config.db_type === "sqlserver";
 });
 
 const selectedConnection = computed(() => sqlConnections.value.find((c) => c.id === connectionId.value));
@@ -664,7 +700,8 @@ watch(
 
           <div class="flex items-center gap-2">
             <input ref="fileInput" type="file" accept=".sql,.sql.gz,.zip,text/sql,application/gzip,application/zip" multiple class="hidden" @change="handleFileInputChange" />
-            <Input :model-value="filePathDisplay" readonly class="h-8 text-xs font-mono" :placeholder="t('sqlFile.selectSqlFile')" />
+            <Input v-if="isDesktopRuntime" v-model="pathInput" :disabled="running" class="h-8 text-xs font-mono" :placeholder="t('sqlFile.selectSqlFile')" @keydown.enter="commitPathInputOnEnter" @blur="commitPathInput" />
+            <Input v-else :model-value="filePathDisplay" readonly class="h-8 text-xs font-mono" :placeholder="t('sqlFile.selectSqlFile')" />
             <Button variant="outline" size="sm" class="h-8 shrink-0" :disabled="running || selectingFile" @click="selectFile">
               <Loader2 v-if="selectingFile || loadingPreview" class="w-3.5 h-3.5 mr-1.5 animate-spin" />
               <FolderOpen v-else class="w-3.5 h-3.5 mr-1.5" />
@@ -799,7 +836,7 @@ watch(
             <Square v-else class="w-3.5 h-3.5 text-muted-foreground/40 shrink-0" />
             {{ t("sqlFile.continueOnError") }}
           </button>
-          <button v-if="isMysqlCompatibleTarget" type="button" class="flex items-center gap-2 text-xs text-left" :disabled="running" @click="skipRelationalConstraints = !skipRelationalConstraints">
+          <button v-if="supportsRelationalConstraintBypass" type="button" class="flex items-center gap-2 text-xs text-left" :disabled="running" @click="skipRelationalConstraints = !skipRelationalConstraints">
             <CheckSquare v-if="skipRelationalConstraints" class="w-3.5 h-3.5 text-primary shrink-0" />
             <Square v-else class="w-3.5 h-3.5 text-muted-foreground/40 shrink-0" />
             {{ t("sqlFile.skipRelationalConstraints") }}

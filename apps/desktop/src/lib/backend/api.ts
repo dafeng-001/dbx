@@ -427,6 +427,9 @@ export const inspectExternalSqlFile = forward("inspectExternalSqlFile");
 export const writeExternalSqlFile = forward("writeExternalSqlFile");
 export const saveExternalSqlFile = forward("saveExternalSqlFile");
 export const listSqlFilesInFolder = forward("listSqlFilesInFolder");
+export const globalSearch = forward("globalSearch");
+export const loadGlobalSearchSettings = forward("loadGlobalSearchSettings");
+export const saveGlobalSearchSettings = forward("saveGlobalSearchSettings");
 export const createSqlFileInFolder = forward("createSqlFileInFolder");
 export const renameSqlFileInFolder = forward("renameSqlFileInFolder");
 export const deleteSqlFileInFolder = forward("deleteSqlFileInFolder");
@@ -825,6 +828,7 @@ export const mongoUpdateDocument = forward("mongoUpdateDocument");
 export const mongoUpdateDocuments = forward("mongoUpdateDocuments");
 export const mongoReplaceDocument = forward("mongoReplaceDocument");
 export const mongoBulkWrite = forward("mongoBulkWrite");
+export const mongoExplainFind = forward("mongoExplainFind");
 export const documentDeleteDocument = forward("documentDeleteDocument");
 export const documentSaveMeilisearchBatch = forward("documentSaveMeilisearchBatch");
 export const meilisearchSearchDocuments = forward("meilisearchSearchDocuments");
@@ -834,6 +838,7 @@ export const meilisearchGetIndexSettings = forward("meilisearchGetIndexSettings"
 export const meilisearchUpdateIndexSettings = forward("meilisearchUpdateIndexSettings");
 export const meilisearchGetIndexStats = forward("meilisearchGetIndexStats");
 export const meilisearchGetIndexOverview = forward("meilisearchGetIndexOverview");
+export const meilisearchCreateIndex = forward("meilisearchCreateIndex");
 export const meilisearchDeleteIndex = forward("meilisearchDeleteIndex");
 export const meilisearchDeleteAllDocuments = forward("meilisearchDeleteAllDocuments");
 export const meilisearchGetSystemOverview = forward("meilisearchGetSystemOverview");
@@ -892,6 +897,9 @@ export const getAppSupportInfo = forward("getAppSupportInfo");
 // Layout
 export const saveSidebarLayout = forward("saveSidebarLayout");
 export const loadSidebarLayout = forward("loadSidebarLayout");
+export const saveTableVGroups = forward("saveTableVGroups");
+export const loadTableVGroups = forward("loadTableVGroups");
+export const deleteTableVGroupsForConnection = forward("deleteTableVGroupsForConnection");
 
 // ---------------------------------------------------------------------------
 // Re-export all types from tauri.ts (shared between both backends)
@@ -917,6 +925,8 @@ export type {
   AgentOfflineExportCandidate,
   AgentOfflineExportPreview,
   AgentOfflineExportResult,
+  AgentOfflineImportFailure,
+  AgentOfflineImportResult,
   DriverStoreUsage,
   DriverStoreUsageItem,
   DriverRuntimeHealth,
@@ -1065,6 +1075,9 @@ export type {
   QueryResultExportRequest,
   AgentEvent,
   SqlFileEntry,
+  GlobalSearchRequest,
+  GlobalSearchMatch,
+  GlobalSearchSettings,
 } from "@/lib/backend/tauri";
 
 // MQTT

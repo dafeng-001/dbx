@@ -932,6 +932,7 @@ async fn main() {
         .route("/document-store/meilisearch/settings/update", post(routes::document_store::meilisearch_update_settings))
         .route("/document-store/meilisearch/stats", post(routes::document_store::meilisearch_get_stats))
         .route("/document-store/meilisearch/overview", post(routes::document_store::meilisearch_get_overview))
+        .route("/document-store/meilisearch/index/create", post(routes::document_store::meilisearch_create_index))
         .route("/document-store/meilisearch/index/delete", post(routes::document_store::meilisearch_delete_index))
         .route(
             "/document-store/meilisearch/system/overview",
@@ -1112,6 +1113,14 @@ async fn main() {
         .route("/changelog", get(routes::update::fetch_changelog))
         // Layout
         .route("/layout/sidebar", post(routes::layout::save_sidebar_layout).get(routes::layout::load_sidebar_layout))
+        .route(
+            "/layout/table-vgroups",
+            post(routes::layout::save_table_vgroups).get(routes::layout::load_table_vgroups),
+        )
+        .route(
+            "/layout/table-vgroups/connection/{connection_id}",
+            delete(routes::layout::delete_table_vgroups_for_connection),
+        )
         // App settings
         .route(
             "/app-settings/pinned-tree-node-ids",

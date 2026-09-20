@@ -211,6 +211,12 @@ describe("normalizeEditorSettings", () => {
     expect(normalizeEditorSettings({ insertSpaceAfterCompletion: false }).insertSpaceAfterCompletion).toBe(false);
   });
 
+  it("keeps SQL Server space-confirm completion off by default and preserves an explicit opt-in", () => {
+    expect(normalizeEditorSettings({}).sqlServerSpaceConfirmsCompletion).toBe(false);
+    expect(normalizeEditorSettings({ sqlServerSpaceConfirmsCompletion: true }).sqlServerSpaceConfirmsCompletion).toBe(true);
+    expect(normalizeEditorSettings({ sqlServerSpaceConfirmsCompletion: "yes" as unknown as boolean }).sqlServerSpaceConfirmsCompletion).toBe(false);
+  });
+
   it("selects the first completion candidate by default and preserves the opt-out", () => {
     expect(normalizeEditorSettings({}).selectFirstCompletionOnOpen).toBe(true);
     expect(normalizeEditorSettings({ selectFirstCompletionOnOpen: true }).selectFirstCompletionOnOpen).toBe(true);
@@ -273,11 +279,17 @@ describe("normalizeEditorSettings", () => {
     expect(normalizeEditorSettings({}).updateDownloadSource).toBe("official");
   });
 
-  it("requires opting into automatic update downloads and preserves the preference", () => {
-    expect(normalizeEditorSettings({}).autoDownloadUpdates).toBe(false);
+  it("migrates legacy update opt-outs without overriding explicit category settings", () => {
+    expect(normalizeEditorSettings({}).autoDownloadUpdates).toBe(true);
     expect(normalizeEditorSettings({ autoDownloadUpdates: true }).autoDownloadUpdates).toBe(true);
     expect(normalizeEditorSettings({ autoDownloadUpdates: false }).autoDownloadUpdates).toBe(false);
-    expect(normalizeEditorSettings({ autoDownloadUpdates: "true" } as any).autoDownloadUpdates).toBe(false);
+    expect(normalizeEditorSettings({ autoDownloadUpdates: false }).autoUpdateDrivers).toBe(true);
+    expect(normalizeEditorSettings({ updateNotificationsEnabled: false }).autoUpdateApp).toBe(false);
+    expect(normalizeEditorSettings({ updateNotificationsEnabled: false }).autoUpdateDrivers).toBe(false);
+    expect(normalizeEditorSettings({ updateNotificationsEnabled: false }).autoUpdateJdbc).toBe(false);
+    expect(normalizeEditorSettings({ updateNotificationsEnabled: false }).autoUpdateMcp).toBe(false);
+    expect(normalizeEditorSettings({ updateNotificationsEnabled: false }).autoUpdatePlugins).toBe(false);
+    expect(normalizeEditorSettings({ autoUpdateApp: false }).autoDownloadUpdates).toBe(false);
   });
 
   it("preserves explicit editor themes from saved settings", () => {
@@ -299,6 +311,41 @@ describe("normalizeEditorSettings", () => {
   it("migrates legacy open tab restore booleans", () => {
     expect(normalizeEditorSettings({ restoreOpenTabsOnLaunch: false } as any).openTabsRestoreMode).toBe("none");
     expect(normalizeEditorSettings({ restoreOpenTabsOnLaunch: true } as any).openTabsRestoreMode).toBe("all");
+  });
+
+  it("defaults the delete-time tab handling to closing tabs and preserves explicit modes", () => {
+    expect(normalizeEditorSettings({}).deleteConnectionTabHandlingMode).toBe("close-tabs");
+    expect(normalizeEditorSettings({ deleteConnectionTabHandlingMode: "keep-sql-tabs" }).deleteConnectionTabHandlingMode).toBe("keep-sql-tabs");
+    expect(normalizeEditorSettings({ deleteConnectionTabHandlingMode: "keep-pinned-sql-tabs" }).deleteConnectionTabHandlingMode).toBe("keep-pinned-sql-tabs");
+    expect(normalizeEditorSettings({ deleteConnectionTabHandlingMode: "keep-all-tabs" }).deleteConnectionTabHandlingMode).toBe("keep-all-tabs");
+    expect(normalizeEditorSettings({ deleteConnectionTabHandlingMode: "invalid" as any }).deleteConnectionTabHandlingMode).toBe("close-tabs");
+    // 早期试验值收敛到最接近的正式取值。
+    expect(normalizeEditorSettings({ deleteConnectionTabHandlingMode: "keep-tabs" } as any).deleteConnectionTabHandlingMode).toBe("keep-sql-tabs");
+    expect(normalizeEditorSettings({ deleteConnectionTabHandlingMode: "keep-pinned" } as any).deleteConnectionTabHandlingMode).toBe("keep-pinned-sql-tabs");
+    expect(normalizeEditorSettings({ deleteConnectionTabHandlingMode: "keep-all" } as any).deleteConnectionTabHandlingMode).toBe("keep-all-tabs");
+  });
+
+  it("remembers connection databases by default and sanitizes the stored map", () => {
+    expect(normalizeEditorSettings({}).rememberConnectionDatabaseOnDelete).toBe(true);
+    expect(normalizeEditorSettings({ rememberConnectionDatabaseOnDelete: false }).rememberConnectionDatabaseOnDelete).toBe(false);
+    expect(normalizeEditorSettings({ rememberConnectionDatabaseOnDelete: "true" } as any).rememberConnectionDatabaseOnDelete).toBe(true);
+    expect(normalizeEditorSettings({ rememberedConnectionDatabases: { prod: { database: "app", dbType: "postgres" } } }).rememberedConnectionDatabases).toEqual({ prod: { database: "app", dbType: "postgres" } });
+    // 空名、缺库名/类型、以及非对象条目全部丢弃。
+    expect(
+      normalizeEditorSettings({
+        rememberedConnectionDatabases: {
+          "  ": { database: "app", dbType: "postgres" },
+          dev: { database: "shop", dbType: "mysql" },
+          noDb: { database: "   ", dbType: "mysql" },
+          noType: { database: "shop" },
+          legacyString: "shop",
+          bad: 3,
+          other: null,
+        },
+      } as any).rememberedConnectionDatabases,
+    ).toEqual({ dev: { database: "shop", dbType: "mysql" } });
+    expect(normalizeEditorSettings({ rememberedConnectionDatabases: [] } as any).rememberedConnectionDatabases).toEqual({});
+    expect(normalizeEditorSettings({ rememberedConnectionDatabases: "prod" } as any).rememberedConnectionDatabases).toEqual({});
   });
 
   it("keeps unsaved SQL drafts on quit by default and preserves explicit modes", () => {
@@ -971,7 +1018,7 @@ describe("settingsStore persisted settings initialization", () => {
       theme: "xcode-dark",
       executeMode: "all",
       executeModeDefaultVersion: 1,
-      updateNotificationsEnabled: false,
+      updateNotificationsEnabled: true,
     });
     const saveEditorSettings = vi.fn().mockResolvedValue(undefined);
     vi.doMock("@/lib/backend/api", () => ({ loadEditorSettings, saveEditorSettings }));
@@ -989,7 +1036,7 @@ describe("settingsStore persisted settings initialization", () => {
       fontSize: 17,
       theme: "xcode-dark",
       executeMode: "all",
-      updateNotificationsEnabled: false,
+      updateNotificationsEnabled: true,
       appLayout: "separated",
     });
     expect(saveEditorSettings).toHaveBeenCalledWith(expect.objectContaining({ fontSize: 17, theme: "xcode-dark", appLayout: "separated" }));

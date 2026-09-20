@@ -155,6 +155,7 @@ import {
   tabularResultItems,
   type ExecutionSummaryItem,
 } from "@/lib/tabs/tabPresentation";
+import { beginPanelResize, endPanelResize } from "@/lib/app/panelResizeState";
 import { defaultQueryResultArchiveFileName } from "@/lib/query/queryResultArchive";
 import { saveQueryResultArchiveFile } from "@/lib/query/queryResultArchiveFile";
 import { isTableDataEditable } from "@/lib/table/tableEditing";
@@ -211,8 +212,14 @@ type DataGridHandle = DataGridColumnLayoutHandle & {
 type SearchableBrowserHandle = {
   focusSearch: (target?: Element | null) => boolean;
   refresh?: () => boolean;
+  matchesRefreshScope?: (scope: ObjectBrowserRefreshScope) => boolean;
   insertCommand?: (command: string) => Promise<boolean>;
   executeCommand?: (command: string) => Promise<boolean>;
+};
+
+type ObjectBrowserRefreshScope = {
+  schema?: string;
+  catalog?: string;
 };
 
 type ElasticsearchJsonResponsePanelHandle = {
@@ -235,6 +242,12 @@ const emit = defineEmits<ContentAreaSurfaceEmits>();
 const { t, locale } = useI18n();
 const queryStore = useQueryStore();
 const connectionStore = useConnectionStore();
+/** Clear a consumed editor reveal request so a later normal tab re-visit doesn't re-jump. */
+function clearEditorRevealRequest(tab: { editorRevealRequest?: unknown }): void {
+  if (tab.editorRevealRequest !== undefined) {
+    tab.editorRevealRequest = undefined;
+  }
+}
 provideTabUiState(() => {
   const tab = props.activeTab;
   const mode = tab.mode;
@@ -267,6 +280,7 @@ onMounted(() => {
   // The watcher below warms the grid for query/data tabs. Keep source-only
   // tabs out of that path: loading the grid there caused freezes (#8103).
   window.addEventListener("dbx-refresh-active-kv-browser", onRefreshActiveKvBrowser);
+  window.addEventListener("dbx-refresh-object-browser", onRefreshObjectBrowser);
   window.addEventListener("resize", updateStandaloneResultToolbarDimensions);
   window.visualViewport?.addEventListener("resize", updateStandaloneResultToolbarDimensions);
   window.addEventListener("dbx:ui-scale-applied", updateStandaloneResultToolbarDimensions);
@@ -708,7 +722,11 @@ function handleHideResultsPane() {
   }
 }
 
+function onResultsSplitResize() {
+  beginPanelResize();
+}
 function onResultsResized(payload: { panes: { size: number }[] }) {
+  endPanelResize();
   const resultsPane = payload.panes[1];
   if (resultsPane?.size != null && resultsPane.size >= 20 && resultsPane.size <= 85) {
     resultsPaneSize.value = resultsPane.size;
@@ -762,6 +780,7 @@ onUnmounted(() => {
   stopRunningElapsedTimer();
   standaloneResultToolbarResizeObserver?.disconnect();
   window.removeEventListener("dbx-refresh-active-kv-browser", onRefreshActiveKvBrowser);
+  window.removeEventListener("dbx-refresh-object-browser", onRefreshObjectBrowser);
   window.removeEventListener("resize", updateStandaloneResultToolbarDimensions);
   window.visualViewport?.removeEventListener("resize", updateStandaloneResultToolbarDimensions);
   window.removeEventListener("dbx:ui-scale-applied", updateStandaloneResultToolbarDimensions);
@@ -1027,11 +1046,29 @@ function onRefreshActiveKvBrowser(event: Event) {
   void nextTick(() => refreshData());
 }
 
+function matchesActiveObjectBrowserRefreshScope(detail: { connectionId?: string; database?: string } & ObjectBrowserRefreshScope): boolean {
+  if (props.activeTab.mode !== "objects" || props.activeTab.connectionId !== detail.connectionId || props.activeTab.database !== detail.database) return false;
+  const matchesRefreshScope = objectBrowserRef.value?.matchesRefreshScope;
+  if (matchesRefreshScope) return matchesRefreshScope(detail);
+  const objectBrowser = props.activeTab.objectBrowser;
+  return (objectBrowser?.schema || props.activeTab.schema || "") === (detail.schema || "") && (objectBrowser?.catalog || props.activeTab.catalog || "") === (detail.catalog || "");
+}
+
+function onRefreshObjectBrowser(event: Event) {
+  const detail = (event as CustomEvent<{ connectionId?: string; database?: string; schema?: string; catalog?: string }>).detail;
+  if (!detail || !matchesActiveObjectBrowserRefreshScope(detail)) return;
+  void nextTick(() => {
+    if (matchesActiveObjectBrowserRefreshScope(detail)) refreshData();
+  });
+}
+
 function openPluginResultView(pluginId: string, contributionId: string, label: string) {
   const result = props.activeTab.result;
   if (!result) return;
-  // Plugin workbenches receive a bounded snapshot; plugins re-query through
-  // their backend when they need the full or streamed result set.
+  // The tab carries the result-view contribution id, not a workbench id: the
+  // plugin UI is told which declared surface the user picked, and it receives a
+  // bounded snapshot — plugins re-query through their backend when they need the
+  // full or streamed result set.
   const cappedRows = result.rows.slice(0, 500);
   queryStore.openPluginWorkbench(pluginId, contributionId, {
     title: label,
@@ -1428,7 +1465,7 @@ defineExpose({
     </div>
     <!-- Query mode: editor + results -->
     <template v-if="activeTab.mode === 'query'">
-      <Splitpanes horizontal class="query-output-splitpanes flex-1 min-h-0 overflow-hidden" @resized="onResultsResized">
+      <Splitpanes horizontal class="query-output-splitpanes flex-1 min-h-0 overflow-hidden" @resize="onResultsSplitResize" @resized="onResultsResized">
         <Pane v-if="!resultOnly" class="min-h-0" :size="editorPaneSize" :min-size="resultsPaneOpen ? 15 : 100">
           <div class="h-full flex flex-col relative">
             <div v-if="activeProductionContext.active" class="production-watermark pointer-events-none absolute inset-0 z-10 grid select-none" aria-hidden="true">
@@ -1472,6 +1509,7 @@ defineExpose({
               :statement-execution-markers="activeStatementExecutionMarkers"
               :initial-viewport="activeTab.editorViewport"
               :initial-selection="activeTab.editorSelection"
+              :reveal-request="activeTab.editorRevealRequest"
               :force-word-wrap="activeTab.forceWordWrap"
               enable-explain-shortcut
               :can-explain="!activeTab.isExecuting && !activeTab.isExplaining && !!executableSql.trim()"
@@ -1483,6 +1521,7 @@ defineExpose({
               @viewport-change="(viewport, tabId) => emit('editorViewportChange', tabId ?? activeTab.id, viewport)"
               @selection-state-change="emit('editorSelectionStateChange', activeTab.id, $event)"
               @editor-state-flushed="emit('editorStateFlushed', activeTab.id)"
+              @editor-reveal-consumed="clearEditorRevealRequest(activeTab)"
               @format-error="emit('formatError', activeTab.id)"
               @execute="emit('execute', activeTab.id, $event)"
               @execute-in-new-result-tab="emit('executeInNewResultTab', activeTab.id, $event)"
@@ -2054,6 +2093,7 @@ defineExpose({
                 :mongo-update-target="mongoQueryResultSaveHandler && activeTab.result.mongo_copy_documents?.length === activeTab.result.rows.length ? activeTab.mongoEditTarget : undefined"
                 :query-editability-reason="activeTab.queryEditabilityReason"
                 :manual-transaction-session-id="activeTab.txnSessionId"
+                :ensure-manual-transaction-session="activeTab.autoCommit === false ? () => queryStore.ensureManualTransactionSession(activeTab.id, activeResultDatabase, activeResultSchema) : undefined"
                 :on-manual-transaction-mutation="() => queryStore.markManualTransactionDirty(activeTab.id)"
                 :allow-insert-rows="activeTab.queryAnalysis?.allowInsert ?? activeTab.queryAnalysis?.allowInsertDelete !== false"
                 :allow-delete-rows="activeTab.queryAnalysis?.allowDelete ?? activeTab.queryAnalysis?.allowInsertDelete !== false"
@@ -2727,23 +2767,25 @@ defineExpose({
 
     <!-- Structure mode: table structure editor -->
     <template v-else-if="activeTab.mode === 'structure'">
-      <TableStructureEditor
-        ref="tableStructureEditorRef"
-        :key="activeTab.id"
-        :connection-id="activeTab.connectionId"
-        :database="activeTab.database"
-        :catalog="activeTab.catalog"
-        :schema="activeTab.schema"
-        :table-name="activeTab.structureTableName || ''"
-        :initial-tab="activeTab.structureInitialTab"
-        :initial-tab-request-id="activeTab.structureInitialTabRequestId"
-        :initial-target="activeTab.structureInitialTarget"
-        :draft="activeTab.structureDraft"
-        @update:draft="(draft) => (activeTab.structureDraft = draft)"
-        @saved="(commentChanged) => emit('structureEditorSaved', activeTab.id, commentChanged)"
-        @close="emit('structureEditorClose', activeTab.id)"
-        @open-settings="(initialTab, initialSection) => emit('openSettings', initialTab, initialSection)"
-      />
+      <div class="flex-1 min-h-0">
+        <TableStructureEditor
+          ref="tableStructureEditorRef"
+          :key="activeTab.id"
+          :connection-id="activeTab.connectionId"
+          :database="activeTab.database"
+          :catalog="activeTab.catalog"
+          :schema="activeTab.schema"
+          :table-name="activeTab.structureTableName || ''"
+          :initial-tab="activeTab.structureInitialTab"
+          :initial-tab-request-id="activeTab.structureInitialTabRequestId"
+          :initial-target="activeTab.structureInitialTarget"
+          :draft="activeTab.structureDraft"
+          @update:draft="(draft) => (activeTab.structureDraft = draft)"
+          @saved="(commentChanged) => emit('structureEditorSaved', activeTab.id, commentChanged)"
+          @close="emit('structureEditorClose', activeTab.id)"
+          @open-settings="(initialTab, initialSection) => emit('openSettings', initialTab, initialSection)"
+        />
+      </div>
     </template>
 
     <template v-else-if="activeTab.mode === 'users' && activeConnection">
