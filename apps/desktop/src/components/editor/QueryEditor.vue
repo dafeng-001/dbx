@@ -181,6 +181,7 @@ import { focusEditorView } from "@/lib/editor/queryEditorFocus";
 import { stabilizeUnfocusedQueryEditorPointerDown } from "@/lib/editor/queryEditorUnfocusedPointer";
 import { createDbxCodeMirrorSqlDialect, type CodeMirrorSqlDialectName } from "@/lib/editor/codemirrorSqlDialect";
 import { sqlSemanticTableNameSpansForSyntaxTree } from "@/lib/editor/codemirrorSqlSemanticHighlight";
+import { createSqlUnknownObjectHighlights, refreshSqlUnknownObjectHighlights, type SqlUnknownObjectSpan } from "@/lib/editor/codemirrorSqlUnknownObjectHighlights";
 import { startsQueryEditorRectangularSelection, startsQueryEditorSelectionDrag, usesQueryEditorObjectNavigationModifier } from "@/lib/editor/queryEditorPointerSelection";
 import { LARGE_PASTE_HISTORY_USER_EVENT, normalizeQueryEditorPasteText, recoverableNativePasteSuffix, shouldRecoverLargeTauriPaste } from "@/lib/editor/queryEditorLargePaste";
 import { queryEditorClipboardPasteChange } from "@/lib/editor/queryEditorClipboardPaste";
@@ -203,6 +204,7 @@ import { analyzeIntentionActions, prepareExpandWildcardContext, buildExpandWildc
 import { loadObjectDdl } from "@/lib/metadata/objectDdlCache";
 import { applyDdlStoragePreference } from "@/lib/sql/ddlStorage";
 import { loadObjectMetadataFacet } from "@/lib/metadata/objectMetadataCache";
+import { sqlTextFingerprint } from "@/lib/sql/sqlTextFingerprint";
 import { queryContextObjectActions, queryContextObjectRoute, queryTableCandidateAtSqlPosition, queryTableNavigationTargetAtSqlPosition, resolveQueryContextCandidateDatabase, resolveQueryContextObjectTarget, type QueryContextObjectAction } from "@/lib/sql/queryCursorTableTarget";
 import * as api from "@/lib/backend/api";
 import { oracleDatabaseLinkCompletionContext, oracleDatabaseLinkCompletionItems } from "@/lib/sql/oracleDatabaseLinkCompletion";
@@ -280,6 +282,11 @@ const COMPLETION_ENTER_MAX_WAIT_MS = 125;
 const SQL_SIGNATURE_HELP_WINDOW_CHARS = 10_000;
 // Internal rollback switch: flip to false to route completion, diagnostics, and navigation through the legacy SQL context path.
 const SEMANTIC_SQL_COMPLETION_ENABLED = true;
+// Master switch for colouring table/column names that the connected database does not have.
+// There is no settings entry yet: flip this to false to turn the whole feature off.
+const SQL_UNKNOWN_OBJECT_HIGHLIGHT_ENABLED = true;
+// Set to true to print one line per scan (elapsed time, statement and metadata counts).
+const SQL_UNKNOWN_OBJECT_PERF_LOG = false;
 
 const emit = defineEmits<{
   "update:modelValue": [value: string];
@@ -517,6 +524,14 @@ const MAX_COMPLETION_TABLES = 200;
 const PRESTO_ON_DEMAND_TABLE_COMPLETION_MIN_PREFIX = 2;
 const PRESTO_ON_DEMAND_TABLE_COMPLETION_LIMIT = 20;
 const MAX_SEMANTIC_DIAGNOSTIC_COLUMN_TABLES = 4;
+// Whole-file unknown-object colouring limits: past any of these the feature stays
+// silent rather than paying an unbounded metadata/parse cost on huge scripts.
+const MAX_SQL_UNKNOWN_OBJECT_SQL_LENGTH = 200_000;
+const MAX_SQL_UNKNOWN_OBJECT_STATEMENTS = 80;
+const SQL_UNKNOWN_OBJECT_COLUMN_TABLE_LIMIT = 24;
+const MAX_SQL_UNKNOWN_OBJECT_MEMO_ENTRIES = 200;
+const SQL_UNKNOWN_OBJECT_INITIAL_DELAY_MS = 900;
+const SQL_UNKNOWN_OBJECT_DEBOUNCE_MS = 600;
 const liveFontSize = ref(settingsStore.editorSettings.fontSize);
 const gestureStartFontSize = ref(settingsStore.editorSettings.fontSize);
 const isGestureZooming = ref(false);
@@ -3815,7 +3830,7 @@ async function enrichSemanticDiagnosticTables(tables: SqlTableReference[], scope
   return { tables: enriched, missingTables };
 }
 
-async function ensureColumnsForSemanticDiagnostics(tables: SqlTableReference[], scope?: CompletionMetadataScope): Promise<Set<string>> {
+async function ensureColumnsForSemanticDiagnostics(tables: SqlTableReference[], scope?: CompletionMetadataScope, limit = MAX_SEMANTIC_DIAGNOSTIC_COLUMN_TABLES): Promise<Set<string>> {
   const missingTables = new Set<string>();
   const seen = new Set<string>();
   const targets: SqlTableReference[] = [];
@@ -3831,7 +3846,7 @@ async function ensureColumnsForSemanticDiagnostics(tables: SqlTableReference[], 
     if (seen.has(normalizedKey)) continue;
     seen.add(normalizedKey);
     targets.push(table);
-    if (targets.length >= MAX_SEMANTIC_DIAGNOSTIC_COLUMN_TABLES) break;
+    if (targets.length >= limit) break;
   }
   await Promise.all(
     targets.map(async (table) => {
@@ -4007,6 +4022,156 @@ function scheduleSemanticDiagnostics(delay = 500, options: { preserveOutsideRang
     semanticDiagnosticTimer = null;
     void refreshSemanticDiagnostics({ preserveOutsideRanges });
   }, delay);
+}
+
+// ==================== 不存在的表名 / 字段名渲染 ====================
+// 目标：在整文件范围内，把数据库中不存在的表名与字段名用文字变色标出。
+// 判定完全复用既有语义诊断链路（buildSqlSemanticDiagnostics 同时产出
+// "Unknown table" 与 "Unknown column"），元数据尚未加载时 columnsForTable
+// 返回 null，因此不会出现假红。关闭方式：SQL_UNKNOWN_OBJECT_HIGHLIGHT_ENABLED = false。
+const NON_SQL_UNKNOWN_OBJECT_DATABASE_TYPES: ReadonlySet<DatabaseType> = new Set(["qdrant", "milvus", "weaviate", "chromadb"]);
+// 语句级结论缓存：key 里已经包含文本指纹与全部元数据 epoch 维度，命中即跳过 IPC。
+const sqlUnknownObjectSpanMemo = new Map<string, SqlUnknownObjectSpan[]>();
+
+function sqlUnknownObjectMemoKey(range: SqlTextRange, metadataEpoch: string): string {
+  return `${sqlTextFingerprint(range.sql)}|${range.from}:${range.to}|${metadataEpoch}`;
+}
+
+function rememberSqlUnknownObjectSpans(key: string, spans: SqlUnknownObjectSpan[]) {
+  sqlUnknownObjectSpanMemo.set(key, spans);
+  while (sqlUnknownObjectSpanMemo.size > MAX_SQL_UNKNOWN_OBJECT_MEMO_ENTRIES) {
+    const oldest = sqlUnknownObjectSpanMemo.keys().next();
+    if (oldest.done) break;
+    sqlUnknownObjectSpanMemo.delete(oldest.value);
+  }
+}
+
+async function loadSqlUnknownObjectSpans(currentView: import("@codemirror/view").EditorView): Promise<SqlUnknownObjectSpan[]> {
+  if (!SQL_UNKNOWN_OBJECT_HIGHLIGHT_ENABLED || !editorIsActive) return [];
+  // Database-type gating lives here (not in the extension) because the tab's
+  // connection can change without rebuilding the extension.
+  if (queryEditorSelectionLanguage() !== "sql") return [];
+  if (props.databaseType && NON_SQL_UNKNOWN_OBJECT_DATABASE_TYPES.has(props.databaseType)) return [];
+  if (!props.connectionId || props.database == null) return [];
+  const doc = currentView.state.doc;
+  // Check the length before toString() so huge documents are never copied.
+  if (doc.length > MAX_SQL_UNKNOWN_OBJECT_SQL_LENGTH) return [];
+  const sql = doc.toString();
+  if (!sql.trim()) return [];
+
+  if (props.databaseType !== "sqlserver") {
+    executableStatementRangeCache = executableStatementRangeCacheForDoc(executableStatementRangeCache, doc, props.databaseType, sqlStatementParameterOptions());
+  }
+  const ranges = sqlSemanticDiagnosticRangesForViewport(sql, [{ from: 0, to: sql.length }], props.databaseType, props.databaseType === "sqlserver" ? undefined : executableStatementRangeCache?.ranges, sqlStatementParameterOptions()).slice(0, MAX_SQL_UNKNOWN_OBJECT_STATEMENTS);
+  if (ranges.length === 0) return [];
+
+  // Sampled once per run so lookups and stores agree; any metadata change
+  // (connection switch, cache revision, newly loaded columns) invalidates it.
+  const metadataEpoch = `${resolveSqlDialectId({ databaseType: props.databaseType, dialect: sqlBehaviorDialect() })}|${props.connectionId}|${props.database}|${props.schema ?? ""}|${props.databaseType}|${completionEpoch}|${cachedColumnsByTable.size}:${loadedColumnsByTable.size}`;
+
+  const startedAt = Date.now();
+  const spans: SqlUnknownObjectSpan[] = [];
+  let analyzedStatements = 0;
+  let touchedTables = 0;
+  let columnMetadataLoads = 0;
+
+  for (const range of ranges) {
+    const memoKey = sqlUnknownObjectMemoKey(range, metadataEpoch);
+    const cachedSpans = sqlUnknownObjectSpanMemo.get(memoKey);
+    if (cachedSpans) {
+      spans.push(...cachedSpans);
+      continue;
+    }
+    if (currentView.state.doc !== doc) return [];
+
+    const statementSpans: SqlUnknownObjectSpan[] = [];
+    try {
+      const analysis = await api.analyzeSqlReferences(
+        range.sql,
+        sqlReferenceAnalysisDialectFor({
+          databaseType: props.databaseType,
+          identifierQuote: connectionStore.connectionIdentifierQuote(props.connectionId),
+          fallbackDialect: props.formatDialect ?? props.dialect ?? "generic",
+        }),
+      );
+      if (currentView.state.doc !== doc) return [];
+
+      const semanticCursor = Math.max(0, Math.min(currentView.state.selection.main.head - range.from, range.sql.length));
+      const semanticModel = SEMANTIC_SQL_COMPLETION_ENABLED
+        ? buildSqlSemanticModel(range.sql, semanticCursor, {
+            databaseType: props.databaseType,
+            dialect: sqlBehaviorDialect(),
+          })
+        : null;
+      const semanticAnalysis = semanticModel ? mergeSqlSemanticReferenceAnalysis(analysis, semanticModel) : analysis;
+      const metadataScope = semanticDiagnosticMetadataScope(sql, range);
+      const scopedAnalysis = {
+        ...semanticAnalysis,
+        tables: semanticDiagnosticTablesForScope(semanticAnalysis.tables, metadataScope),
+      };
+      const { tables, missingTables } = await enrichSemanticDiagnosticTables(scopedAnalysis.tables, metadataScope);
+      const loadedColumnsBefore = loadedColumnsByTable.size;
+      const columnMetadataMissingTables = await ensureColumnsForSemanticDiagnostics(tables, metadataScope, SQL_UNKNOWN_OBJECT_COLUMN_TABLE_LIMIT);
+      for (const tableKey of columnMetadataMissingTables) missingTables.add(tableKey);
+      if (currentView.state.doc !== doc) return [];
+
+      touchedTables += tables.length;
+      columnMetadataLoads += Math.max(0, loadedColumnsByTable.size - loadedColumnsBefore);
+
+      // Passing the statement text (not the whole document) is required:
+      // isVisibleProjectionAlias resolves GROUP BY / ORDER BY aliases from it.
+      const diagnostics = offsetSqlSemanticDiagnostics(
+        buildSqlSemanticDiagnostics(
+          { ...scopedAnalysis, tables },
+          {
+            tables: cachedTables,
+            columnsByTable: cachedColumnsByTable,
+            missingTables,
+            loadedColumnTables: loadedColumnsByTable,
+            sql: range.sql,
+            databaseType: props.databaseType,
+          },
+        ),
+        range,
+        sql,
+      );
+      for (const diagnostic of diagnostics) {
+        const offsetRange = sqlTextSpanToRange(sql, diagnostic.span);
+        if (offsetRange) statementSpans.push(offsetRange);
+      }
+    } catch {
+      // A failed parse must not colour anything.
+    }
+
+    analyzedStatements += 1;
+    rememberSqlUnknownObjectSpans(memoKey, statementSpans);
+    spans.push(...statementSpans);
+  }
+
+  const dedupedSpans: SqlUnknownObjectSpan[] = [];
+  const seenSpans = new Set<string>();
+  for (const span of spans) {
+    const key = `${span.from}:${span.to}`;
+    if (seenSpans.has(key)) continue;
+    seenSpans.add(key);
+    dedupedSpans.push(span);
+  }
+  dedupedSpans.sort((left, right) => left.from - right.from || left.to - right.to);
+
+  if (SQL_UNKNOWN_OBJECT_PERF_LOG) {
+    console.debug("[sql-unknown-object]", {
+      sqlLength: sql.length,
+      statements: ranges.length,
+      analyzedStatements,
+      memoHits: ranges.length - analyzedStatements,
+      touchedTables,
+      cachedColumnTables: columnMetadataLoads,
+      spans: dedupedSpans.length,
+      elapsedMs: Date.now() - startedAt,
+    });
+  }
+
+  return dedupedSpans;
 }
 
 async function formatCurrentSql() {
@@ -6870,6 +7035,12 @@ onMounted(async () => {
     ),
     sqlSemanticHighlightTheme(EditorView),
     shellLineCommentTheme(EditorView),
+    createSqlUnknownObjectHighlights({
+      enabled: SQL_UNKNOWN_OBJECT_HIGHLIGHT_ENABLED,
+      load: loadSqlUnknownObjectSpans,
+      initialDelayMs: SQL_UNKNOWN_OBJECT_INITIAL_DELAY_MS,
+      debounceMs: SQL_UNKNOWN_OBJECT_DEBOUNCE_MS,
+    }),
   ];
 
   const initialSettings = settingsStore.editorSettings;
@@ -8035,6 +8206,7 @@ function resumeQueryEditorBackgroundWork() {
   editorIsActive = true;
   registerTableReferenceDropListener();
   scheduleSemanticDiagnostics();
+  view.value?.dispatch({ effects: [refreshSqlUnknownObjectHighlights.of(null)] });
   if (view.value) schedulePreviewContextRefresh(view.value);
   restoreEditorSelection(undefined, !props.initialViewport);
   restoreEditorFocus();
