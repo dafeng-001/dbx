@@ -19,6 +19,16 @@ plugins/sdk/dev-host/** text=auto eol=lf
 vendor/webview2-com-sys/**/*.lib -text -diff
 vendor/webview2-com-sys/**/*.dll -text -diff
 
+# Rewritten by scripts/sync-connection-types.mjs and the Tauri permission
+# autogenerator, both of which emit LF on every platform. Without an explicit
+# eol=lf these paths fall back to core.autocrlf (true in the Git for Windows
+# system config), so Git expects CRLF in the working tree while the generators
+# keep writing LF. Every regeneration then leaves a stale CRLF-sized stat entry
+# and the files show as modified even though their bytes already match the
+# index, until someone re-stats them by hand.
+crates/dbx-core/assets/database-drivers.manifest.json text eol=lf
+vendor/tauri-plugin-updater/permissions/** text eol=lf
+
 # Keep tests available for review and CI without counting them as shipped code
 # in GitHub's repository language breakdown.
 packages/app-tests/** linguist-vendored
