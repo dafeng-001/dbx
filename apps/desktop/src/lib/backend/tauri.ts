@@ -1,8 +1,12 @@
 import { invoke as tauriInvoke } from "@tauri-apps/api/core";
 import type { MongoDumpFormat, MongoDumpSourceInput, MongoDumpCatalog, MongoRestoreSourcePreview, MongoDatabaseDumpRequest, MongoDatabaseRestoreRequest, MongoDatabaseDumpProgress } from "./mongodbDumpTypes";
 import type { MongoRestoreUpload, MongoSourceReadOptions } from "./mongodbDumpTypes";
+import type { UserSkillRootSettings, UserSkillsListResult, UserSkillsReadResult } from "@/types/userSkills";
 import { assertUpdateAllowsCommand } from "@/lib/app/updatePreparation";
 import { collectBrowserSupportInfo } from "@/lib/app/supportInfo";
+// Re-exported below so the HTTP transport shares one definition; imported here
+// for this module's own signatures (a re-export does not bind local names).
+import type { PluginPlanCapabilities, PluginPlanRequest, PluginPlanResult } from "@/types/pluginPlan";
 
 function invoke<T>(command: string, args?: Record<string, unknown>): Promise<T> {
   assertUpdateAllowsCommand(command);
@@ -119,7 +123,7 @@ import type { DmlChangePreviewSqlOptions, DmlChangePreviewSqlResult } from "@/li
 import type { DataGridExtractRequest, DataGridExtractResult } from "@/lib/dataGrid/dataGridCopyExtractor";
 import type { DataCompareFromTablesOptions, DataCompareFromTablesPreparation, DataCompareSyncPlan, DataCompareSyncPlanOptions, DataComparePreparation, DataComparePreparationOptions } from "@/lib/dataGrid/dataCompare";
 import type { SchemaDiffPreparation, SchemaDiffPreparationOptions, SchemaSyncSqlPlan, SelectedSchemaDiffInput, GenerateSchemaSyncPlanOptions, TableDiff, FunctionDiff, SequenceDiff, RuleDiff, OwnerDiff } from "@/lib/schema/schemaDiff";
-import type { BuildTableOwnerChangeSqlOptions, BuildTableStructureChangeSqlOptions, BuildSingleColumnAlterSqlOptions, SqliteTableStructureChangePreview, TableStructureChangeSql } from "@/lib/table/tableStructureEditorSql";
+import type { BuildCreatePartitionedTableSqlOptions, BuildTableOwnerChangeSqlOptions, BuildTableStructureChangeSqlOptions, BuildSingleColumnAlterSqlOptions, SqliteTableStructureChangePreview, TablePartitionSqlOptions, TableStructureChangeSql } from "@/lib/table/tableStructureEditorSql";
 import type { BuildTableSelectSqlOptions } from "@/lib/table/tableSelectSql";
 import type { DatabaseSearchSql, DatabaseSearchSqlOptions, SearchResultWhereOptions } from "@/lib/database/databaseSearch";
 import type { BuildEditableObjectSourceSqlInput, BuildRoutineRenameObjectSourceInput } from "@/lib/table/objectSourceEditor";
@@ -287,6 +291,8 @@ export interface DesktopSettings {
   driver_store_dir?: string | null;
   plugin_store_dir?: string | null;
   agent_store_dir?: string | null;
+  custom_ai_skill_root_enabled?: boolean | null;
+  custom_ai_skill_root?: string | null;
   sidebar_table_page_size?: number | null;
 }
 
@@ -369,10 +375,11 @@ export interface WebDavSyncSecretsStatus {
   hasSavedPassphrase: boolean;
 }
 
-export type SnippetProvider = "github" | "gitee";
+export type SnippetProvider = "github" | "gitee" | "gitlab";
 
 export interface SnippetSyncConfig {
   provider: SnippetProvider;
+  instanceUrl?: string;
   token?: string;
   snippetId?: string;
   replaceLegacySnippet?: boolean;
@@ -782,6 +789,14 @@ export async function saveMaxAgentTurns(maxAgentTurns: number): Promise<void> {
   return invoke("save_max_agent_turns", { maxAgentTurns });
 }
 
+export async function loadHistoryRetentionLimit(): Promise<number> {
+  return invoke("load_history_retention_limit");
+}
+
+export async function saveHistoryRetentionLimit(limit: number): Promise<void> {
+  return invoke("save_history_retention_limit", { limit });
+}
+
 export async function loadMaxRetries(): Promise<number> {
   return invoke("load_max_retries");
 }
@@ -791,6 +806,8 @@ export async function saveMaxRetries(maxRetries: number): Promise<void> {
 }
 
 export type { OpenTabsStatePayload, PersistedEditorGroup } from "@/lib/app/openTabsPersistence";
+/** Shared with `@/lib/plugins/pluginHostBridge`; re-exported so the HTTP transport reuses one definition. */
+export type { PluginPlanCapabilities, PluginPlanRequest, PluginPlanResult } from "@/types/pluginPlan";
 import type { OpenTabsStatePayload } from "@/lib/app/openTabsPersistence";
 import { uuid } from "@/lib/common/utils";
 
@@ -978,12 +995,12 @@ export async function forgetSnippetSavedToken(config: SnippetSyncConfig): Promis
   return invoke("forget_snippet_saved_token", { config });
 }
 
-export async function snippetSyncSettings(provider: SnippetProvider): Promise<SnippetSyncSettings> {
-  return invoke("snippet_sync_settings", { provider });
+export async function snippetSyncSettings(provider: SnippetProvider, instanceUrl?: string): Promise<SnippetSyncSettings> {
+  return invoke("snippet_sync_settings", { provider, instanceUrl });
 }
 
-export async function saveSnippetSyncId(provider: SnippetProvider, snippetId?: string): Promise<void> {
-  return invoke("save_snippet_sync_id", { provider, snippetId });
+export async function saveSnippetSyncId(provider: SnippetProvider, snippetId?: string, instanceUrl?: string): Promise<void> {
+  return invoke("save_snippet_sync_id", { provider, snippetId, instanceUrl });
 }
 
 export async function retrySnippetLegacyCleanup(config: SnippetSyncConfig): Promise<SnippetSyncSettings> {
@@ -1143,6 +1160,7 @@ export interface AiChatMessage {
 }
 
 export interface AiConversation {
+  pluginContext?: import("@/lib/ai/aiPluginConversation").AiPluginContext;
   id: string;
   title: string;
   connectionName: string;
@@ -1232,6 +1250,14 @@ export async function setAiGlobalCustomInstructions(content: string): Promise<vo
   return invoke("set_ai_global_custom_instructions", { content });
 }
 
+export async function listUserSkills(settings: UserSkillRootSettings): Promise<UserSkillsListResult> {
+  return invoke("list_user_skills", { customRootEnabled: settings.customRootEnabled, customRoot: settings.customRoot });
+}
+
+export async function readUserSkills(ids: string[], settings: UserSkillRootSettings): Promise<UserSkillsReadResult> {
+  return invoke("read_user_skills", { ids, customRootEnabled: settings.customRootEnabled, customRoot: settings.customRoot });
+}
+
 export async function testConnection(config: ConnectionConfig): Promise<string> {
   return invokeBackend("test_connection", { config });
 }
@@ -1308,6 +1334,10 @@ export async function replaceNacosSessionCredential(connectionId: string, userna
 
 export async function checkConnectionHealth(connectionId: string): Promise<void> {
   return invokeBackend("check_connection_health", { connectionId });
+}
+
+export async function prewarmConnection(connectionId: string, database?: string, catalog?: string, clientSessionId?: string): Promise<void> {
+  return invokeBackend("prewarm_connection", { connectionId, database, catalog, clientSessionId });
 }
 
 export async function connectionIdentifierQuote(connectionId: string, database?: string): Promise<string | undefined> {
@@ -1593,6 +1623,10 @@ export async function executeMulti(
     useTransaction?: boolean;
     continueOnError?: boolean;
     executionMode?: "simple";
+    /** MySQL auto-commit tabs: keep a transaction the user opened explicitly
+     *  (`BEGIN` / `START TRANSACTION`) open across executions until COMMIT /
+     *  ROLLBACK instead of rolling it back when the batch ends. */
+    preserveExplicitTransaction?: boolean;
   },
 ): Promise<QueryResult[]> {
   const diagnosticsEnabled = isDebugLoggingEnabled();
@@ -1659,6 +1693,7 @@ export async function executeMultiWithProgress(
     useTransaction?: boolean;
     continueOnError?: boolean;
     executionMode?: "simple";
+    preserveExplicitTransaction?: boolean;
     executionId?: string;
   },
 ): Promise<QueryResult[]> {
@@ -1712,13 +1747,14 @@ export async function closeClientConnectionSession(connectionId: string, databas
   });
 }
 
-export async function executeBatch(connectionId: string, database: string, statements: string[], schema?: string, timeoutSecs?: number): Promise<QueryResult> {
+export async function executeBatch(connectionId: string, database: string, statements: string[], schema?: string, timeoutSecs?: number, useTransaction?: boolean): Promise<QueryResult> {
   return invoke("execute_batch", {
     connectionId,
     database,
     statements,
     schema,
     timeoutSecs,
+    useTransaction,
   });
 }
 
@@ -1805,6 +1841,19 @@ export async function getExplainInfo(connectionId: string, database: string | un
     sql,
     mode,
   });
+}
+
+/** Plugin Host API: what the host and this connection can plan. Never connects. */
+export async function getPluginPlanCapabilities(connectionId: string): Promise<PluginPlanCapabilities> {
+  return invoke<PluginPlanCapabilities>("get_plugin_plan_capabilities", { connectionId });
+}
+
+/**
+ * Plugin Host API: acquires the estimated plan for caller-supplied SQL. The
+ * backend generates and owns the EXPLAIN statement; the request cannot carry one.
+ */
+export async function getPluginEstimatedPlan(request: PluginPlanRequest): Promise<PluginPlanResult> {
+  return invoke<PluginPlanResult>("get_plugin_estimated_plan", { request });
 }
 
 export async function buildDroppedFilePreviewSql(options: DroppedFilePreviewSqlOptions): Promise<string | undefined> {
@@ -1940,6 +1989,14 @@ export async function buildTableStructureChangeSql(options: BuildTableStructureC
 
 export async function buildTableOwnerChangeSql(options: BuildTableOwnerChangeSqlOptions): Promise<TableStructureChangeSql> {
   return invoke("build_table_owner_change_sql", { options });
+}
+
+export async function buildTablePartitionOperationSql(options: TablePartitionSqlOptions): Promise<TableStructureChangeSql> {
+  return invoke("build_table_partition_operation_sql", { options });
+}
+
+export async function buildCreatePartitionedTableSql(options: BuildCreatePartitionedTableSqlOptions): Promise<TableStructureChangeSql> {
+  return invoke("build_create_partitioned_table_sql", { options: options.options, partitioning: options.partitioning });
 }
 
 export async function previewSqliteTableStructureChange(connectionId: string, database: string, options: BuildTableStructureChangeSqlOptions): Promise<SqliteTableStructureChangePreview> {
@@ -2148,6 +2205,15 @@ export interface TablePartitionStatus {
 
 export async function getTablePartitionStatus(connectionId: string, database: string, schema: string, table: string): Promise<TablePartitionStatus> {
   return invoke("get_table_partition_status", {
+    connectionId,
+    database,
+    schema,
+    table,
+  });
+}
+
+export async function getTablePartitioning(connectionId: string, database: string, schema: string, table: string): Promise<import("@/types/database").PgTablePartitioning> {
+  return invoke("get_table_partitioning", {
     connectionId,
     database,
     schema,
@@ -2398,6 +2464,54 @@ export async function notifyPlugin(pluginId: string, method: string, params: unk
 
 export async function sendPluginBinary(pluginId: string, channel: string, dataBase64: string): Promise<void> {
   return invoke("send_plugin_binary", { pluginId, channel, dataBase64 });
+}
+
+export interface PluginLocalFileHandle {
+  /** Opaque uuid string from the Rust registry — never a number (JS doubles lose precision above 2^53). */
+  handleId: string;
+  name: string;
+  size: number;
+  contentType: string;
+  write: boolean;
+}
+
+export interface PluginLocalFileChunk {
+  dataBase64: string;
+  length: number;
+  eof: boolean;
+}
+
+export interface PluginLocalFileWriteResult {
+  written: number;
+  nextOffset: number;
+}
+
+export async function openPluginLocalFile(pluginId: string, path: string, write: boolean): Promise<PluginLocalFileHandle> {
+  return invoke("plugin_file_open", { pluginId, path, write });
+}
+
+export async function readPluginLocalFileChunk(pluginId: string, handleId: string, offset: number, length?: number): Promise<PluginLocalFileChunk> {
+  return invoke("plugin_file_read", { pluginId, handleId, offset, length });
+}
+
+export async function writePluginLocalFileChunk(pluginId: string, handleId: string, offset: number, dataBase64: string): Promise<PluginLocalFileWriteResult> {
+  return invoke("plugin_file_write", { pluginId, handleId, offset, dataBase64 });
+}
+
+export async function closePluginLocalFile(pluginId: string, handleId: string): Promise<void> {
+  return invoke("plugin_file_close", { pluginId, handleId });
+}
+
+export async function getPluginUiStorage(pluginId: string, key: string): Promise<unknown> {
+  return invoke("plugin_ui_storage_get", { pluginId, key });
+}
+
+export async function setPluginUiStorage(pluginId: string, key: string, value: unknown): Promise<void> {
+  return invoke("plugin_ui_storage_set", { pluginId, key, value });
+}
+
+export async function deletePluginUiStorage(pluginId: string, key: string): Promise<void> {
+  return invoke("plugin_ui_storage_delete", { pluginId, key });
 }
 
 export async function listPluginFilesystemEntries(pluginId: string, providerId: string, options: { connectionId?: string; uri?: string; cursor?: string; limit?: number } = {}): Promise<PluginFilesystemListResult> {
@@ -4291,7 +4405,7 @@ export interface ElasticsearchDeleteByQueryResult {
   failures: string[];
 }
 
-export async function elasticsearchGetIndexMetadata(connectionId: string, index: string, kind: ElasticsearchIndexMetadataKind): Promise<Record<string, any>> {
+export async function elasticsearchGetIndexMetadata(connectionId: string, index: string, kind: ElasticsearchIndexMetadataKind): Promise<Record<string, unknown>> {
   return invoke("elasticsearch_get_index_metadata", {
     connectionId,
     index,
@@ -4655,6 +4769,11 @@ export interface MeilisearchIndexOverview {
   updatedAt: string | null;
   numberOfDocuments: number;
   isIndexing: boolean;
+  /** Raw document store size of this index (Meilisearch >= 1.14); null on older servers. */
+  documentSize: number | null;
+  /** Average document size of this index (Meilisearch >= 1.14); null on older servers. */
+  avgDocumentSize: number | null;
+  /** Instance-wide database size; every index shares it, so it is only a fallback. */
   databaseSize: number | null;
 }
 
@@ -5450,6 +5569,8 @@ export interface TableExportRequest {
   csvQuoteMode?: CsvQuoteMode;
   columns?: string[];
   columnTypes?: Array<string | null | undefined>;
+  /** 与 `columns` 对齐的列 EXTRA 元数据（identity 等），用于 SQL INSERT 导出的 `SET IDENTITY_INSERT`。 */
+  columnExtras?: Array<string | null | undefined>;
   columnComments?: Array<string | null> | null;
   primaryKeys?: string[];
   /** 导出 SQL 时是否排除主键列（对应数据提取设置里的“排除主键”）。 */
@@ -5512,6 +5633,11 @@ export interface QueryResultExportRequest {
   dateTimeFormat?: string;
   exportTableName?: string;
   exportColumnTypes?: Array<string | null | undefined>;
+  /**
+   * 结果列对应的原表 EXTRA 元数据（identity 等）。后端据此为 SQL INSERT 导出
+   * 补上 `SET IDENTITY_INSERT` 包裹，缺省表示未知。
+   */
+  exportColumnExtras?: Array<string | null | undefined>;
   numericColumnRightAlign?: boolean;
   columnComments?: Array<string | null> | null;
   autoFilter?: boolean;

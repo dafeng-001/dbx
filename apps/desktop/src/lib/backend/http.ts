@@ -1,5 +1,6 @@
 import type { MongoDumpFormat, MongoDumpSourceInput, MongoDumpCatalog, MongoRestoreSourcePreview, MongoDatabaseDumpRequest, MongoDatabaseRestoreRequest, MongoDatabaseDumpProgress } from "./mongodbDumpTypes";
 import type { MongoRestoreUpload, MongoSourceReadOptions } from "./mongodbDumpTypes";
+import type { UserSkillRootSettings, UserSkillsListResult, UserSkillsReadResult } from "@/types/userSkills";
 import type {
   ConnectionConfig,
   ConnectionTestResult,
@@ -160,6 +161,9 @@ import type {
   QuerySqlBuildResult,
   BuildExplainSqlOptions,
   ExplainSqlBuildResult,
+  PluginPlanCapabilities,
+  PluginPlanRequest,
+  PluginPlanResult,
   DroppedFilePreviewSqlOptions,
   MongoGridFsFileInfo,
   AppSupportInfo,
@@ -186,7 +190,7 @@ import type {
 } from "@/lib/dataGrid/dataGridSql";
 import type { DmlChangePreviewSqlOptions, DmlChangePreviewSqlResult } from "@/lib/sql/dmlChangePreview";
 import type { DataGridExtractRequest, DataGridExtractResult } from "@/lib/dataGrid/dataGridCopyExtractor";
-import type { BuildTableOwnerChangeSqlOptions, BuildTableStructureChangeSqlOptions, BuildSingleColumnAlterSqlOptions, SqliteTableStructureChangePreview, TableStructureChangeSql } from "@/lib/table/tableStructureEditorSql";
+import type { BuildCreatePartitionedTableSqlOptions, BuildTableOwnerChangeSqlOptions, BuildTableStructureChangeSqlOptions, BuildSingleColumnAlterSqlOptions, SqliteTableStructureChangePreview, TablePartitionSqlOptions, TableStructureChangeSql } from "@/lib/table/tableStructureEditorSql";
 import type { BuildTableSelectSqlOptions } from "@/lib/table/tableSelectSql";
 import type { DatabaseSearchSql, DatabaseSearchSqlOptions, SearchResultWhereOptions } from "@/lib/database/databaseSearch";
 import type { BuildEditableObjectSourceSqlInput, BuildRoutineRenameObjectSourceInput } from "@/lib/table/objectSourceEditor";
@@ -300,6 +304,8 @@ const DEFAULT_DESKTOP_SETTINGS: DesktopSettings = {
   driver_store_dir: null,
   plugin_store_dir: null,
   agent_store_dir: null,
+  custom_ai_skill_root_enabled: false,
+  custom_ai_skill_root: null,
   sidebar_table_page_size: 1000,
 };
 
@@ -480,6 +486,10 @@ export async function replaceNacosSessionCredential(connectionId: string, userna
 
 export async function checkConnectionHealth(connectionId: string): Promise<void> {
   return post("/api/connection/check-health", { connectionId });
+}
+
+export async function prewarmConnection(connectionId: string, database?: string, catalog?: string, clientSessionId?: string): Promise<void> {
+  return post("/api/connection/prewarm", { connectionId, database, catalog, clientSessionId });
 }
 
 export async function connectionIdentifierQuote(connectionId: string, database?: string): Promise<string | undefined> {
@@ -891,6 +901,14 @@ export async function exportAgentsOffline(_path: string, _driverKeys: string[]):
   throw new Error("Offline Agent package export is only available in the desktop app.");
 }
 
+export async function listUserSkills(_settings: UserSkillRootSettings): Promise<UserSkillsListResult> {
+  throw new Error("AI skills are only available in the desktop app.");
+}
+
+export async function readUserSkills(_ids: string[], _settings: UserSkillRootSettings): Promise<UserSkillsReadResult> {
+  throw new Error("AI skills are only available in the desktop app.");
+}
+
 export async function importAgentDriver(dbType: string, pathOrFile: string | File): Promise<void> {
   let blob: Blob;
   let fileName: string;
@@ -1176,6 +1194,10 @@ export async function getTablePartitionStatus(connectionId: string, database: st
   return get(`/api/schema/table-partition-status?${qs({ connection_id: connectionId, database, schema, table })}`);
 }
 
+export async function getTablePartitioning(connectionId: string, database: string, schema: string, table: string): Promise<import("@/types/database").PgTablePartitioning> {
+  return get(`/api/schema/table-partitioning?${qs({ connection_id: connectionId, database, schema, table })}`);
+}
+
 export async function listInvalidIndexes(connectionId: string, database: string, schema: string, table: string): Promise<string[]> {
   return get(`/api/schema/invalid-indexes?${qs({ connection_id: connectionId, database, schema, table })}`);
 }
@@ -1364,6 +1386,10 @@ export async function executeMulti(
     useTransaction?: boolean;
     continueOnError?: boolean;
     executionMode?: "simple";
+    /** MySQL auto-commit tabs: keep a transaction the user opened explicitly
+     *  (`BEGIN` / `START TRANSACTION`) open across executions until COMMIT /
+     *  ROLLBACK instead of rolling it back when the batch ends. */
+    preserveExplicitTransaction?: boolean;
   },
 ): Promise<QueryResult[]> {
   return postQueryWithDiagnostics(
@@ -1412,6 +1438,7 @@ export async function executeMultiWithProgress(
     useTransaction?: boolean;
     continueOnError?: boolean;
     executionMode?: "simple";
+    preserveExplicitTransaction?: boolean;
     executionId?: string;
   },
 ): Promise<QueryResult[]> {
@@ -1455,13 +1482,14 @@ export async function closeClientConnectionSession(connectionId: string, databas
   });
 }
 
-export async function executeBatch(connectionId: string, database: string, statements: string[], schema?: string, timeoutSecs?: number): Promise<QueryResult> {
+export async function executeBatch(connectionId: string, database: string, statements: string[], schema?: string, timeoutSecs?: number, useTransaction?: boolean): Promise<QueryResult> {
   return post("/api/query/execute-batch", {
     connectionId,
     database,
     statements,
     schema,
     timeoutSecs,
+    useTransaction,
   });
 }
 
@@ -1565,6 +1593,19 @@ export async function getExplainInfo(connectionId: string, database: string | un
     sql,
     mode,
   });
+}
+
+/** Plugin Host API: what the host and this connection can plan. Never connects. */
+export async function getPluginPlanCapabilities(connectionId: string): Promise<PluginPlanCapabilities> {
+  return post<PluginPlanCapabilities>("/api/query/plugin-plan-capabilities", { connectionId });
+}
+
+/**
+ * Plugin Host API: acquires the estimated plan for caller-supplied SQL. The
+ * backend generates and owns the EXPLAIN statement; the request cannot carry one.
+ */
+export async function getPluginEstimatedPlan(request: PluginPlanRequest): Promise<PluginPlanResult> {
+  return post<PluginPlanResult>("/api/query/plugin-estimated-plan", request);
 }
 
 export async function buildDroppedFilePreviewSql(options: DroppedFilePreviewSqlOptions): Promise<string | undefined> {
@@ -1694,6 +1735,14 @@ export async function buildTableStructureChangeSql(options: BuildTableStructureC
 
 export async function buildTableOwnerChangeSql(options: BuildTableOwnerChangeSqlOptions): Promise<TableStructureChangeSql> {
   return post("/api/query/build-table-owner-change-sql", { options });
+}
+
+export async function buildTablePartitionOperationSql(options: TablePartitionSqlOptions): Promise<TableStructureChangeSql> {
+  return post("/api/query/build-table-partition-operation-sql", { options });
+}
+
+export async function buildCreatePartitionedTableSql(options: BuildCreatePartitionedTableSqlOptions): Promise<TableStructureChangeSql> {
+  return post("/api/query/build-create-partitioned-table-sql", { options: options.options, partitioning: options.partitioning });
 }
 
 export async function previewSqliteTableStructureChange(connectionId: string, database: string, options: BuildTableStructureChangeSqlOptions): Promise<SqliteTableStructureChangePreview> {
@@ -2080,6 +2129,19 @@ export async function saveMaxAgentTurns(maxAgentTurns: number): Promise<void> {
   if (!res.ok) throw await backendResponseError(res);
 }
 
+export async function loadHistoryRetentionLimit(): Promise<number> {
+  return get("/api/app-settings/history-retention-limit");
+}
+
+export async function saveHistoryRetentionLimit(limit: number): Promise<void> {
+  const res = await fetch(apiUrl("/api/app-settings/history-retention-limit"), {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ limit }),
+  });
+  if (!res.ok) throw await backendResponseError(res);
+}
+
 export async function loadMaxRetries(): Promise<number> {
   return get("/api/app-settings/max-retries");
 }
@@ -2252,10 +2314,11 @@ export interface WebDavSyncSecretsStatus {
   hasSavedPassphrase: boolean;
 }
 
-export type SnippetProvider = "github" | "gitee";
+export type SnippetProvider = "github" | "gitee" | "gitlab";
 
 export interface SnippetSyncConfig {
   provider: SnippetProvider;
+  instanceUrl?: string;
   token?: string;
   snippetId?: string;
   replaceLegacySnippet?: boolean;
@@ -2345,12 +2408,12 @@ export async function forgetSnippetSavedToken(config: SnippetSyncConfig): Promis
   await post("/api/cloud-sync/snippet/forget-token", { config });
 }
 
-export async function snippetSyncSettings(provider: SnippetProvider): Promise<SnippetSyncSettings> {
-  return post("/api/cloud-sync/snippet/settings", { provider });
+export async function snippetSyncSettings(provider: SnippetProvider, instanceUrl?: string): Promise<SnippetSyncSettings> {
+  return post("/api/cloud-sync/snippet/settings", { provider, instanceUrl });
 }
 
-export async function saveSnippetSyncId(provider: SnippetProvider, snippetId?: string): Promise<void> {
-  await post("/api/cloud-sync/snippet/save-id", { provider, snippetId });
+export async function saveSnippetSyncId(provider: SnippetProvider, snippetId?: string, instanceUrl?: string): Promise<void> {
+  await post("/api/cloud-sync/snippet/save-id", { provider, snippetId, instanceUrl });
 }
 
 export async function retrySnippetLegacyCleanup(config: SnippetSyncConfig): Promise<SnippetSyncSettings> {
@@ -4493,7 +4556,7 @@ export async function elasticsearchCountDocuments(connectionId: string, index: s
   });
 }
 
-export async function elasticsearchGetIndexMetadata(connectionId: string, index: string, kind: ElasticsearchIndexMetadataKind): Promise<Record<string, any>> {
+export async function elasticsearchGetIndexMetadata(connectionId: string, index: string, kind: ElasticsearchIndexMetadataKind): Promise<Record<string, unknown>> {
   return post("/api/document-store/elasticsearch/index-metadata", {
     connectionId,
     index,
@@ -5111,3 +5174,40 @@ export async function refreshConnections(): Promise<void> {
 
 export * from "@/lib/backend/mq-http";
 export * from "@/lib/backend/mqtt-http";
+
+// ---------------------------------------------------------------------------
+// Plugin local file streaming (native dialogs / OS drops are Tauri-only)
+// ---------------------------------------------------------------------------
+
+import type { PluginLocalFileChunk, PluginLocalFileHandle, PluginLocalFileWriteResult } from "./tauri";
+
+export async function openPluginLocalFile(_pluginId: string, _path: string, _write: boolean): Promise<PluginLocalFileHandle> {
+  throw new Error("Plugin local file access is not available in the web backend");
+}
+
+export async function readPluginLocalFileChunk(_pluginId: string, _handleId: string, _offset: number, _length?: number): Promise<PluginLocalFileChunk> {
+  throw new Error("Plugin local file access is not available in the web backend");
+}
+
+export async function writePluginLocalFileChunk(_pluginId: string, _handleId: string, _offset: number, _dataBase64: string): Promise<PluginLocalFileWriteResult> {
+  throw new Error("Plugin local file access is not available in the web backend");
+}
+
+export async function closePluginLocalFile(_pluginId: string, _handleId: string): Promise<void> {
+  throw new Error("Plugin local file access is not available in the web backend");
+}
+
+// Plugin UI storage goes through the Rust plugin-data tree on native hosts;
+// the web workbench host keeps its localStorage fallback in the component, so
+// these only exist to satisfy the shared backend surface.
+export async function getPluginUiStorage(_pluginId: string, _key: string): Promise<unknown> {
+  throw new Error("Plugin UI storage is not available in the web backend");
+}
+
+export async function setPluginUiStorage(_pluginId: string, _key: string, _value: unknown): Promise<void> {
+  throw new Error("Plugin UI storage is not available in the web backend");
+}
+
+export async function deletePluginUiStorage(_pluginId: string, _key: string): Promise<void> {
+  throw new Error("Plugin UI storage is not available in the web backend");
+}

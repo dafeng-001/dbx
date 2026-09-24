@@ -241,6 +241,8 @@ pub struct CopyTableDataSqlOptions {
     #[serde(default)]
     pub sqlserver_identity_insert: bool,
     #[serde(default)]
+    pub dameng_identity_insert: bool,
+    #[serde(default)]
     pub normalize_new_target_name: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identifier_quote: Option<String>,
@@ -796,7 +798,12 @@ pub fn build_duplicate_table_structure_sql(options: DuplicateTableStructureSqlOp
     } else if options.database_type.is_some_and(uses_false_predicate_duplicate_structure) {
         format!("CREATE TABLE {target} AS SELECT * FROM {source} WHERE 1=0")
     } else {
-        format!("CREATE TABLE {target} AS SELECT * FROM {source} WHERE 0;")
+        // `WHERE 1=0` rather than `WHERE 0`: PostgreSQL-family engines (HighGo, Kingbase,
+        // Vastbase, ...) and DuckDB require a boolean in WHERE and reject a bare integer
+        // with "argument of WHERE must be type boolean, not type integer" (#9950).
+        // `1=0` is a valid false predicate in every dialect, including the permissive
+        // MySQL/SQLite-style engines that also accepted `0`.
+        format!("CREATE TABLE {target} AS SELECT * FROM {source} WHERE 1=0;")
     };
 
     let mut comment_sql = Vec::new();
@@ -895,7 +902,10 @@ pub fn build_copy_table_data_sql(options: CopyTableDataSqlOptions) -> String {
     let insert_sql = format!(
         "INSERT INTO {target} ({target_column_list}){postgres_override} SELECT {source_column_list} FROM {source};"
     );
-    if options.sqlserver_identity_insert && options.database_type == Some(DatabaseType::SqlServer) {
+    let needs_identity_insert = (options.sqlserver_identity_insert
+        && options.database_type == Some(DatabaseType::SqlServer))
+        || (options.dameng_identity_insert && options.database_type == Some(DatabaseType::Dameng));
+    if needs_identity_insert {
         return format!("SET IDENTITY_INSERT {target} ON;\n{insert_sql}\nSET IDENTITY_INSERT {target} OFF;");
     }
     insert_sql
@@ -2264,6 +2274,51 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_table_structure_uses_boolean_false_predicate_for_pg_family_fallbacks() {
+        // Regression for #9950: the generic fallback used `WHERE 0`. PostgreSQL-family
+        // engines require a boolean there, so cloning a HighGo/Kingbase/Vastbase table
+        // failed with "argument of WHERE must be type boolean, not type integer".
+        for database_type in [
+            DatabaseType::Highgo,
+            DatabaseType::Kingbase,
+            DatabaseType::Vastbase,
+            DatabaseType::DuckDb,
+            DatabaseType::Sqlite,
+        ] {
+            assert_eq!(
+                build_duplicate_table_structure_sql(DuplicateTableStructureSqlOptions {
+                    database_type: Some(database_type),
+                    schema: Some("public".to_string()),
+                    source_name: "users".to_string(),
+                    target_name: "users_copy".to_string(),
+                    table_comment: None,
+                    column_comments: vec![],
+                    primary_key_columns: vec![],
+                    primary_key_constraint_name: None,
+                    identifier_quote: None,
+                }),
+                "CREATE TABLE \"public\".\"users_copy\" AS SELECT * FROM \"public\".\"users\" WHERE 1=0;",
+                "{database_type:?}"
+            );
+        }
+        // MySQL keeps the LIKE form, so the shared fallback must not have swallowed it.
+        assert_eq!(
+            build_duplicate_table_structure_sql(DuplicateTableStructureSqlOptions {
+                database_type: Some(DatabaseType::Mysql),
+                schema: None,
+                source_name: "users".to_string(),
+                target_name: "users_copy".to_string(),
+                table_comment: None,
+                column_comments: vec![],
+                primary_key_columns: vec![],
+                primary_key_constraint_name: None,
+                identifier_quote: None,
+            }),
+            "CREATE TABLE `users_copy` LIKE `users`;"
+        );
+    }
+
+    #[test]
     fn builds_duplicate_table_structure_sql() {
         assert_eq!(
             build_duplicate_table_structure_sql(DuplicateTableStructureSqlOptions {
@@ -2554,6 +2609,7 @@ mod tests {
                 columns: None,
                 postgres_overriding_system_value: false,
                 sqlserver_identity_insert: false,
+                dameng_identity_insert: false,
                 normalize_new_target_name: false,
                 identifier_quote: None,
             }),
@@ -2568,6 +2624,7 @@ mod tests {
                 columns: Some(vec!["id".to_string(), "name".to_string()]),
                 postgres_overriding_system_value: false,
                 sqlserver_identity_insert: false,
+                dameng_identity_insert: false,
                 normalize_new_target_name: false,
                 identifier_quote: None,
             }),
@@ -2582,6 +2639,7 @@ mod tests {
                 columns: Some(vec!["id".to_string(), "name".to_string()]),
                 postgres_overriding_system_value: true,
                 sqlserver_identity_insert: false,
+            dameng_identity_insert: false,
                 normalize_new_target_name: false,
                 identifier_quote: None,
             }),
@@ -2596,11 +2654,40 @@ mod tests {
                 columns: Some(vec!["id".to_string(), "name".to_string()]),
                 postgres_overriding_system_value: false,
                 sqlserver_identity_insert: true,
+            dameng_identity_insert: false,
                 normalize_new_target_name: false,
                 identifier_quote: None,
             }),
             "SET IDENTITY_INSERT [dbo].[users_copy] ON;\nINSERT INTO [dbo].[users_copy] ([id], [name]) SELECT [id], [name] FROM [dbo].[users];\nSET IDENTITY_INSERT [dbo].[users_copy] OFF;"
         );
+        {
+            let dameng = build_copy_table_data_sql(CopyTableDataSqlOptions {
+                database_type: Some(DatabaseType::Dameng),
+                schema: Some("DCSS".to_string()),
+                source_name: "users".to_string(),
+                target_name: "users_copy".to_string(),
+                columns: Some(vec!["id".to_string(), "name".to_string()]),
+                postgres_overriding_system_value: false,
+                sqlserver_identity_insert: false,
+                dameng_identity_insert: true,
+                normalize_new_target_name: false,
+                identifier_quote: None,
+            });
+            assert!(dameng.starts_with("SET IDENTITY_INSERT "), "dameng copy should enable identity insert: {dameng}");
+            assert!(dameng.ends_with("OFF;"), "dameng copy should disable identity insert: {dameng}");
+            assert!(
+                dameng.contains("INSERT INTO ") && dameng.contains(" SELECT "),
+                "dameng copy should carry an INSERT..SELECT: {dameng}"
+            );
+            // Dameng rejects assigning an identity column unless a column list is specified.
+            assert!(
+                dameng.contains("(\"id\", \"name\")")
+                    || dameng.contains("(`id`, `name`)")
+                    || dameng.contains("(id, name)")
+                    || dameng.contains("([id], [name])"),
+                "dameng copy must use an explicit column list: {dameng}"
+            );
+        }
         assert_eq!(
             build_copy_table_data_sql(CopyTableDataSqlOptions {
                 database_type: Some(DatabaseType::Dameng),
@@ -2610,6 +2697,7 @@ mod tests {
                 columns: None,
                 postgres_overriding_system_value: false,
                 sqlserver_identity_insert: false,
+                dameng_identity_insert: false,
                 normalize_new_target_name: true,
                 identifier_quote: None,
             }),
@@ -2624,6 +2712,7 @@ mod tests {
                 columns: None,
                 postgres_overriding_system_value: false,
                 sqlserver_identity_insert: false,
+                dameng_identity_insert: false,
                 normalize_new_target_name: false,
                 identifier_quote: None,
             }),
@@ -2638,6 +2727,7 @@ mod tests {
                 columns: Some(vec!["user_id".to_string(), "userName".to_string(), "order total".to_string()]),
                 postgres_overriding_system_value: false,
                 sqlserver_identity_insert: false,
+            dameng_identity_insert: false,
                 normalize_new_target_name: true,
                 identifier_quote: None,
             }),
@@ -2652,6 +2742,7 @@ mod tests {
                 columns: Some(vec!["user_id".to_string()]),
                 postgres_overriding_system_value: false,
                 sqlserver_identity_insert: false,
+                dameng_identity_insert: false,
                 normalize_new_target_name: false,
                 identifier_quote: None,
             }),
@@ -2711,6 +2802,7 @@ mod tests {
             columns: Some(vec!["user_id".to_string(), "userName".to_string()]),
             postgres_overriding_system_value: false,
             sqlserver_identity_insert: false,
+            dameng_identity_insert: false,
             normalize_new_target_name: true,
             identifier_quote: None,
         });

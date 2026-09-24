@@ -389,6 +389,7 @@ async fn main() {
         .route("/connection/final-proxy-port", post(routes::connection::connection_final_proxy_port))
         .route("/connection/disconnect", post(routes::connection::disconnect_db))
         .route("/connection/check-health", post(routes::connection::check_connection_health))
+        .route("/connection/prewarm", post(routes::connection::prewarm_connection))
         .route("/connection/session-credential-status", post(routes::connection::session_credential_status))
         .route("/connection/forget-session-credential", post(routes::connection::forget_session_credential))
         .route(
@@ -519,6 +520,7 @@ async fn main() {
         .route("/schema/constraints", get(routes::schema::list_constraints))
         .route("/schema/partitions", get(routes::schema::list_partitions))
         .route("/schema/table-partition-status", get(routes::schema::get_table_partition_status))
+        .route("/schema/table-partitioning", get(routes::schema::get_table_partitioning))
         .route("/schema/invalid-indexes", get(routes::schema::list_invalid_indexes))
         .route("/schema/subpartitions", get(routes::schema::list_subpartitions))
         .route("/schema/functions", get(routes::schema::list_functions))
@@ -567,6 +569,8 @@ async fn main() {
         .route("/query/build-explain-sql", post(routes::query::build_explain_sql))
         .route("/query/build-dropped-file-preview-sql", post(routes::query::build_dropped_file_preview_sql))
         .route("/query/get-explain-info", post(routes::query::get_explain_info))
+        .route("/query/plugin-plan-capabilities", post(routes::query::get_plugin_plan_capabilities))
+        .route("/query/plugin-estimated-plan", post(routes::query::get_plugin_estimated_plan))
         .route("/query/build-create-user-sql", post(routes::query::build_create_user_sql))
         .route("/query/build-table-select-sql", post(routes::query::build_table_select_sql))
         .route("/query/build-database-search-sql", post(routes::query::build_database_search_sql))
@@ -602,6 +606,8 @@ async fn main() {
         .route("/query/build-view-ddl-sql", post(routes::query::build_view_ddl_sql))
         .route("/query/build-table-structure-change-sql", post(routes::query::build_table_structure_change_sql))
         .route("/query/build-table-owner-change-sql", post(routes::query::build_table_owner_change_sql))
+        .route("/query/build-table-partition-operation-sql", post(routes::query::build_table_partition_operation_sql))
+        .route("/query/build-create-partitioned-table-sql", post(routes::query::build_create_partitioned_table_sql))
         .route(
             "/query/preview-sqlite-table-structure-change",
             post(routes::query::preview_sqlite_table_structure_change),
@@ -1134,6 +1140,11 @@ async fn main() {
         .route(
             "/app-settings/max-agent-turns",
             get(routes::app_settings::load_max_agent_turns).put(routes::app_settings::save_max_agent_turns),
+        )
+        .route(
+            "/app-settings/history-retention-limit",
+            get(routes::app_settings::load_history_retention_limit)
+                .put(routes::app_settings::save_history_retention_limit),
         )
         .route(
             "/app-settings/max-retries",

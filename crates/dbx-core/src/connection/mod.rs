@@ -58,6 +58,12 @@ const DEFAULT_AGENT_CONNECT_TIMEOUT_SECS: u64 = 30;
 const ACCESS_AGENT_CONNECT_TIMEOUT_SECS: u64 = 30;
 const POOL_CLOSE_TIMEOUT_SECS: u64 = 3;
 const HEALTH_CHECK_POOL_ACQUIRE_TIMEOUT: Duration = Duration::from_millis(500);
+/// Upper bound for the "is this checked-out connection still alive" query that
+/// follows a successful health checkout. Windows keeps retransmitting on a
+/// half-open TCP connection for ~21s before the read fails, so a probe without
+/// its own budget would make `check_connection_health` (and therefore
+/// `ensureConnected`) hang for the whole OS retry window.
+const HEALTH_CHECK_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) const METADATA_POOL_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) const METADATA_POOL_DEFAULT_LIMIT: usize = 6;
 pub(crate) const METADATA_POOL_SQLSERVER_LIMIT: usize = 1;
@@ -110,6 +116,7 @@ pub enum PoolKind {
     SqlServer(Arc<tokio::sync::Mutex<db::sqlserver::SqlServerClient>>),
     Elasticsearch(db::elasticsearch_driver::EsClient),
     Easysearch(db::easysearch_driver::EasysearchClient),
+    Solr(db::solr_driver::SolrClient),
     Meilisearch(db::meilisearch_driver::MeilisearchClient),
     HBase(db::hbase_driver::HBaseClient),
     VectorDb(db::vector_driver::VectorClient),
@@ -383,6 +390,13 @@ pub struct AppState {
     /// PostgreSQL TLS cancel context, keyed by pool_key.
     /// Used to reconstruct a TLS connector compatible with the original connection when cancelling.
     postgres_cancel_contexts: Arc<RwLock<HashMap<String, db::postgres::PostgresCancelContext>>>,
+    /// Pool keys whose tab-scoped MySQL connection holds a transaction the user
+    /// opened explicitly and DBX deliberately kept open
+    /// (`preserve_explicit_transaction`). Keeping it here — not on the driver
+    /// connection — makes the state die with the pool: a reconnect, a rebuilt
+    /// pool, or a closed tab can never inherit a transaction that no longer
+    /// exists.
+    mysql_preserved_transactions: Arc<RwLock<HashSet<String>>>,
     pub transaction_sessions: Arc<RwLock<HashMap<String, TransactionSession>>>,
     /// `save_password=false` 连接本次运行期的临时密码（内存，进程退出即丢，
     /// 绝不落盘）。键为 `(owner_scope, connection_id)`：桌面端 owner 为空串，
@@ -531,6 +545,13 @@ struct PoolRoutingControl {
     connections: Arc<RwLock<ConnectionPoolRegistry>>,
     pool_activity: Arc<RwLock<HashMap<String, PoolActivity>>>,
     postgres_cancel_contexts: Arc<RwLock<HashMap<String, db::postgres::PostgresCancelContext>>>,
+    /// The same set as [`AppState::mysql_preserved_transactions`]. Every detach
+    /// path (including `ClientSessionPoolCleanupGuard`'s `Drop`, which never
+    /// reaches `AppState`) has to clear the marker together with the pool:
+    /// otherwise a pool rebuilt under the same key would read a stale
+    /// `already_preserved` and keep a leftover transaction the way #9479
+    /// described, even with the opt-in turned off.
+    mysql_preserved_transactions: Arc<RwLock<HashSet<String>>>,
     task_supervisor: TaskSupervisor,
 }
 
@@ -687,9 +708,11 @@ impl PoolRoutingControl {
         {
             let mut activity = self.pool_activity.write().await;
             let mut cancel_contexts = self.postgres_cancel_contexts.write().await;
+            let mut preserved = self.mysql_preserved_transactions.write().await;
             for (key, _) in &removed {
                 activity.remove(key);
                 cancel_contexts.remove(key);
+                preserved.remove(key);
             }
         }
         self.close_removed_in_background(removed);
@@ -1364,6 +1387,25 @@ impl AppState {
         inspect(&connections.pools)
     }
 
+    /// Whether DBX currently holds a pool for `connection_id`, i.e. the
+    /// connection is open right now.
+    ///
+    /// A saved config proves nothing on its own: a disconnected connection keeps
+    /// its config while every one of its pools has been drained. The registry is
+    /// the only state that answers "is this connection open", so callers that
+    /// must not connect on a user's behalf gate on this instead of on
+    /// [`Self::configs`].
+    ///
+    /// Deliberately a pure registry read: it never calls
+    /// `get_or_create_pool`, so checking the state cannot itself open the
+    /// connection. Ownership uses the same key convention as
+    /// `drain_connection_pools` — the connection id, optionally followed by `:`
+    /// and the database/catalog/role/session suffix that `base_pool_key_for` and
+    /// its session-scoped variant build.
+    pub async fn is_connection_open(&self, connection_id: &str) -> bool {
+        self.connections.read().await.keys().any(|key| pool_key_belongs_to_connection(key, connection_id))
+    }
+
     /// Mutate the registry atomically. The callback is deliberately
     /// synchronous; asynchronous cleanup must use values returned from it.
     pub async fn update_connection_pools<R>(&self, update: impl FnOnce(&mut ConnectionPoolRegistry) -> R) -> R {
@@ -1376,6 +1418,7 @@ impl AppState {
             connections: self.connections.clone(),
             pool_activity: self.pool_activity.clone(),
             postgres_cancel_contexts: self.postgres_cancel_contexts.clone(),
+            mysql_preserved_transactions: self.mysql_preserved_transactions.clone(),
             task_supervisor: self.task_supervisor.clone(),
         }
     }
@@ -1503,6 +1546,7 @@ impl AppState {
             duckdb_worker_process_isolation: AtomicBool::new(false),
             duckdb_worker_max_processes: AtomicUsize::new(DUCKDB_WORKER_MAX_PROCESSES_DEFAULT),
             postgres_cancel_contexts: Arc::new(RwLock::new(HashMap::new())),
+            mysql_preserved_transactions: Arc::new(RwLock::new(HashSet::new())),
             transaction_sessions: Arc::new(RwLock::new(HashMap::new())),
             session_credentials: SessionCredentialStore::new(),
             write_unlock_windows: crate::write_unlock::WriteUnlockWindows::default(),
@@ -2722,6 +2766,22 @@ impl AppState {
                 )?;
                 db::easysearch_driver::test_connection(&mut client, connect_timeout).await?;
                 PoolKind::Easysearch(client)
+            }
+            DatabaseType::Solr => {
+                let mut client = db::solr_driver::SolrClient::from_config(
+                    &url,
+                    Some(&db_config.username),
+                    Some(&db_config.password),
+                    db_config.ssl,
+                    db_config.url_params.as_deref(),
+                    db_config.external_config.as_ref(),
+                    connect_timeout,
+                    Some(db_config.ca_cert_path.as_str()),
+                    Some(db_config.client_cert_path.as_str()),
+                    Some(db_config.client_key_path.as_str()),
+                )?;
+                db::solr_driver::test_connection(&mut client, connect_timeout).await?;
+                PoolKind::Solr(client)
             }
             DatabaseType::Meilisearch => {
                 let client = db::meilisearch_driver::MeilisearchClient::new_for_config(
@@ -3952,7 +4012,6 @@ impl AppState {
                 }
                 PoolKind::Postgres(pool) => {
                     let pool = pool.clone();
-                    let timeout = crate::db::connection_timeout();
                     match db::postgres::checkout_postgres_client_classified(
                         &pool,
                         None,
@@ -3960,20 +4019,33 @@ impl AppState {
                     )
                     .await
                     {
-                        Ok(client) => match tokio::time::timeout(timeout, client.simple_query("SELECT 1")).await {
-                            Ok(Ok(_)) => false,
-                            Ok(Err(err)) => {
-                                log::warn!("PostgreSQL connection pool '{pool_key}' is stale: {err}");
-                                true
+                        Ok(client) => {
+                            match tokio::time::timeout(HEALTH_CHECK_PROBE_TIMEOUT, client.simple_query("SELECT 1"))
+                                .await
+                            {
+                                Ok(Ok(_)) => false,
+                                Ok(Err(err)) => {
+                                    log::warn!("PostgreSQL connection pool '{pool_key}' is stale: {err}");
+                                    true
+                                }
+                                Err(_) => {
+                                    log::warn!(
+                                        "PostgreSQL connection pool '{pool_key}' is stale: health check timed out"
+                                    );
+                                    true
+                                }
                             }
-                            Err(_) => {
-                                log::warn!("PostgreSQL connection pool '{pool_key}' is stale: health check timed out");
-                                true
-                            }
-                        },
-                        Err(err) if err.is_pool_saturation() => {
+                        }
+                        // The 500 ms probe budget is intentionally shorter than a foreground checkout. A timeout
+                        // while waiting, creating, or recycling is inconclusive: slow remote handshakes, pool
+                        // re-creation after a keepalive eviction, and active metadata exports can legitimately
+                        // exceed it. Removing the pool here would start competing reconnects while useful work is
+                        // still running, which is exactly how a sub-second probe turns into a multi-second wait on
+                        // the user's next statement. Keep the pool and let the executor's ReconnectAndRetry path
+                        // decide, matching the MySQL branch above.
+                        Err(err @ db::PoolCheckoutError::Timeout { .. }) => {
                             log::debug!(
-                                "PostgreSQL connection pool '{pool_key}' is busy; skipping health probe: {err}"
+                                "PostgreSQL connection pool '{pool_key}' did not finish a health checkout; keeping pool: {err}"
                             );
                             false
                         }
@@ -4061,6 +4133,17 @@ impl AppState {
                         Ok(()) => false,
                         Err(err) => {
                             log::warn!("Easysearch connection pool '{pool_key}' is stale: {err}");
+                            true
+                        }
+                    }
+                }
+                PoolKind::Solr(client) => {
+                    let mut client = client.clone();
+                    let timeout = crate::db::connection_timeout();
+                    match db::solr_driver::test_connection(&mut client, timeout).await {
+                        Ok(()) => false,
+                        Err(err) => {
+                            log::warn!("Solr connection pool '{pool_key}' is stale: {err}");
                             true
                         }
                     }
@@ -4569,14 +4652,30 @@ impl AppState {
         self.stop_keepalive_task(&pool_key).await;
         self.pool_activity.write().await.remove(&pool_key);
         self.postgres_cancel_contexts.write().await.remove(&pool_key);
+        self.mysql_preserved_transactions.write().await.remove(&pool_key);
         let removed = self.update_connection_pools(|connections| connections.remove(&pool_key)).await;
         Ok(removed.map(|pool| (pool_key, pool)))
+    }
+
+    /// Whether `pool_key` keeps a transaction the user opened explicitly open
+    /// on purpose (MySQL auto-commit tabs with `preserve_explicit_transaction`).
+    pub(crate) async fn has_preserved_explicit_transaction(&self, pool_key: &str) -> bool {
+        self.mysql_preserved_transactions.read().await.contains(pool_key)
+    }
+
+    pub(crate) async fn mark_preserved_explicit_transaction(&self, pool_key: &str) {
+        self.mysql_preserved_transactions.write().await.insert(pool_key.to_string());
+    }
+
+    pub(crate) async fn clear_preserved_explicit_transaction(&self, pool_key: &str) {
+        self.mysql_preserved_transactions.write().await.remove(pool_key);
     }
 
     pub async fn remove_pool_by_key(&self, pool_key: &str) -> bool {
         self.stop_keepalive_task(pool_key).await;
         self.pool_activity.write().await.remove(pool_key);
         self.postgres_cancel_contexts.write().await.remove(pool_key);
+        self.mysql_preserved_transactions.write().await.remove(pool_key);
         let removed = self.connections.write().await.remove(pool_key);
         if let Some(pool) = removed {
             self.pool_routing_control().close_pool_with_timeout(pool_key.to_string(), pool).await;
@@ -5081,6 +5180,33 @@ impl AppState {
         Ok(())
     }
 
+    /// Warm the driver/pool a tab is about to use, off the user's critical path.
+    ///
+    /// The first statement of a session pays costs that the user perceives as
+    /// "the query is still loading" but that never appear in the reported
+    /// statement duration: creating the pool, spawning a JDBC/agent driver
+    /// session (JVM startup for external drivers such as Oracle), opening
+    /// tunnels, and completing TLS/startup handshakes. `get_or_create_pool_*`
+    /// performs exactly that work and verifies connectivity before returning, so
+    /// calling it while the editor is being opened moves those seconds from the
+    /// first Run to a moment where nobody is waiting on the result.
+    ///
+    /// This is deliberately *not* a health probe: it never tears an existing
+    /// pool down. Use `check_connection_health` when the caller needs a verdict.
+    pub async fn prewarm_connection_pool(
+        &self,
+        connection_id: &str,
+        database: Option<&str>,
+        catalog: Option<&str>,
+        client_session_id: Option<&str>,
+    ) -> Result<(), String> {
+        let pool_key = self
+            .get_or_create_pool_for_session_with_catalog(connection_id, database, catalog, client_session_id)
+            .await?;
+        self.touch_pool_activity(&pool_key).await;
+        Ok(())
+    }
+
     pub async fn refresh_connections(&self) {
         // Clone pool handles under a short-lived read lock, then release it
         // before performing I/O-heavy health checks to avoid blocking writers.
@@ -5107,19 +5233,30 @@ impl AppState {
                 },
                 PoolKind::Postgres(p) => {
                     match db::postgres::checkout_postgres_client_classified(p, None, timeout).await {
-                        Ok(client) => match tokio::time::timeout(timeout, client.simple_query("SELECT 1")).await {
-                            Ok(Ok(_)) => true,
-                            Ok(Err(e)) => {
-                                log::warn!("PostgreSQL connection pool '{key}' is unhealthy: {e}");
-                                false
+                        Ok(client) => {
+                            match tokio::time::timeout(HEALTH_CHECK_PROBE_TIMEOUT, client.simple_query("SELECT 1"))
+                                .await
+                            {
+                                Ok(Ok(_)) => true,
+                                Ok(Err(e)) => {
+                                    log::warn!("PostgreSQL connection pool '{key}' is unhealthy: {e}");
+                                    false
+                                }
+                                Err(_) => {
+                                    log::warn!(
+                                        "PostgreSQL connection pool '{key}' is unhealthy: health check timed out"
+                                    );
+                                    false
+                                }
                             }
-                            Err(_) => {
-                                log::warn!("PostgreSQL connection pool '{key}' is unhealthy: health check timed out");
-                                false
-                            }
-                        },
-                        Err(error) if error.is_pool_saturation() => {
-                            log::debug!("PostgreSQL connection pool '{key}' is busy; skipping health probe: {error}");
+                        }
+                        // A checkout timeout is inconclusive rather than proof of a dead pool: the budget can be
+                        // consumed by a concurrent create/recycle, and tearing the pool down here would make the
+                        // next foreground statement pay a full reconnect. Mirror `remove_stale_connection_pool`.
+                        Err(error @ db::PoolCheckoutError::Timeout { .. }) => {
+                            log::debug!(
+                                "PostgreSQL connection pool '{key}' did not finish a health checkout; keeping pool: {error}"
+                            );
                             true
                         }
                         Err(error) => {
@@ -5175,6 +5312,16 @@ impl AppState {
                         Ok(()) => true,
                         Err(e) => {
                             log::warn!("Easysearch connection pool '{key}' is unhealthy: {e}");
+                            false
+                        }
+                    }
+                }
+                PoolKind::Solr(client) => {
+                    let mut client = client.clone();
+                    match db::solr_driver::test_connection(&mut client, timeout).await {
+                        Ok(()) => true,
+                        Err(e) => {
+                            log::warn!("Solr connection pool '{key}' is unhealthy: {e}");
                             false
                         }
                     }
@@ -5580,6 +5727,7 @@ enum KeepaliveTarget {
     SqlServer(Arc<tokio::sync::Mutex<db::sqlserver::SqlServerClient>>),
     Elasticsearch(db::elasticsearch_driver::EsClient),
     Easysearch(db::easysearch_driver::EasysearchClient),
+    Solr(db::solr_driver::SolrClient),
     HBase(db::hbase_driver::HBaseClient),
     VectorDb(db::vector_driver::VectorClient),
     InfluxDb(db::influxdb_driver::InfluxdbClient),
@@ -5681,6 +5829,7 @@ fn keepalive_target_from_pool(pool: &PoolKind, config: &ConnectionConfig) -> Opt
         PoolKind::SqlServer(client) => Some(KeepaliveTarget::SqlServer(client.clone())),
         PoolKind::Elasticsearch(client) => Some(KeepaliveTarget::Elasticsearch(client.clone())),
         PoolKind::Easysearch(client) => Some(KeepaliveTarget::Easysearch(client.clone())),
+        PoolKind::Solr(client) => Some(KeepaliveTarget::Solr(client.clone())),
         PoolKind::HBase(client) => Some(KeepaliveTarget::HBase(client.clone())),
         PoolKind::VectorDb(client) => Some(KeepaliveTarget::VectorDb(client.clone())),
         PoolKind::InfluxDb(client) => Some(KeepaliveTarget::InfluxDb(client.clone())),
@@ -5723,6 +5872,7 @@ async fn ping_keepalive_target(target: &mut KeepaliveTarget, timeout: Duration) 
         KeepaliveTarget::Easysearch(client) => {
             db::easysearch_driver::test_connection(client, timeout).await.map_err(Into::into)
         }
+        KeepaliveTarget::Solr(client) => db::solr_driver::test_connection(client, timeout).await.map_err(Into::into),
         KeepaliveTarget::HBase(client) => {
             db::hbase_driver::test_connection(client, timeout).await.map(|_| ()).map_err(Into::into)
         }
@@ -5989,15 +6139,24 @@ fn is_manual_transaction_pool_key(pool_key: &str) -> bool {
     pool_key.contains(":session:manual-txn-")
 }
 
+/// Whether `pool_key` names a pool owned by `connection_id`.
+///
+/// Every pool key starts with its connection id and appends `:` plus the
+/// database, catalog, role, or session suffix, so the separator is what keeps
+/// `conn` from matching a `conn-2` pool. Used by
+/// [`AppState::is_connection_open`] and [`config_for_pool_key`];
+/// `drain_connection_pools` filters on the same convention.
+fn pool_key_belongs_to_connection(pool_key: &str, connection_id: &str) -> bool {
+    pool_key.strip_prefix(connection_id).is_some_and(|rest| rest.is_empty() || rest.starts_with(':'))
+}
+
 pub(crate) fn config_for_pool_key<'a>(
     pool_key: &str,
     configs: &'a HashMap<String, ConnectionConfig>,
 ) -> Option<&'a ConnectionConfig> {
     configs
         .iter()
-        .filter(|(connection_id, _)| {
-            pool_key.strip_prefix(connection_id.as_str()).is_some_and(|rest| rest.is_empty() || rest.starts_with(':'))
-        })
+        .filter(|(connection_id, _)| pool_key_belongs_to_connection(pool_key, connection_id))
         .max_by_key(|(connection_id, _)| connection_id.len())
         .map(|(_, config)| config)
 }
@@ -6134,6 +6293,7 @@ fn clone_pool_kind(pool: &PoolKind) -> PoolKind {
         PoolKind::SqlServer(client) => PoolKind::SqlServer(client.clone()),
         PoolKind::Elasticsearch(client) => PoolKind::Elasticsearch(client.clone()),
         PoolKind::Easysearch(client) => PoolKind::Easysearch(client.clone()),
+        PoolKind::Solr(client) => PoolKind::Solr(client.clone()),
         PoolKind::Meilisearch(client) => PoolKind::Meilisearch(client.clone()),
         PoolKind::HBase(client) => PoolKind::HBase(client.clone()),
         PoolKind::VectorDb(client) => PoolKind::VectorDb(client.clone()),
@@ -6191,6 +6351,9 @@ async fn close_pool_kind(pool: PoolKind) -> Result<(), String> {
             drop(client);
         }
         PoolKind::Easysearch(client) => {
+            drop(client);
+        }
+        PoolKind::Solr(client) => {
             drop(client);
         }
         PoolKind::Meilisearch(client) => {
@@ -6291,6 +6454,7 @@ fn base_pool_key_for_with_catalog(
                     db_type,
                     DatabaseType::Elasticsearch
                         | DatabaseType::Easysearch
+                        | DatabaseType::Solr
                         | DatabaseType::Qdrant
                         | DatabaseType::Milvus
                         | DatabaseType::Weaviate
@@ -7888,6 +8052,55 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    // A health probe that cannot finish its checkout within the 500 ms budget is
+    // inconclusive, not proof of a dead pool. Tearing the pool down used to turn
+    // one slow probe into a full reconnect on the user's next statement, which
+    // showed up as a loading indicator of several seconds next to a summary that
+    // only counted the statement itself.
+    #[tokio::test]
+    async fn postgres_health_check_keeps_pool_when_checkout_budget_is_exhausted() {
+        // Accept connections but never answer the PostgreSQL startup packet, so
+        // every attempt to create a connection runs into its own timeout.
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                held.push(socket);
+            }
+        });
+        let mut pg_config = tokio_postgres::Config::new();
+        pg_config.host(address.ip().to_string()).port(address.port()).user("health-probe").dbname("health-probe");
+        let manager = deadpool_postgres::Manager::new(pg_config, tokio_postgres::NoTls);
+        let pool = deadpool_postgres::Pool::builder(manager)
+            .runtime(deadpool_postgres::Runtime::Tokio1)
+            .max_size(2)
+            .wait_timeout(Some(Duration::from_millis(200)))
+            .create_timeout(Some(Duration::from_millis(200)))
+            .recycle_timeout(Some(Duration::from_millis(200)))
+            .build()
+            .expect("build PostgreSQL health probe pool");
+        let (state, dir) = test_app_state().await;
+        state.connections.write().await.insert("conn".to_string(), PoolKind::Postgres(pool.clone()));
+
+        let started = Instant::now();
+        assert!(!state.remove_stale_connection_pool("conn").await);
+
+        assert!(
+            started.elapsed() >= Duration::from_millis(150),
+            "probe must actually run into the checkout budget, took {:?}",
+            started.elapsed()
+        );
+        assert!(
+            matches!(state.connections.read().await.get("conn"), Some(PoolKind::Postgres(_))),
+            "an inconclusive PostgreSQL probe must not remove the pool"
+        );
+        state.connections.write().await.remove("conn");
+        server.abort();
+        pool.close();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[tokio::test]
     async fn mysql_health_check_keeps_pool_when_connection_creation_exceeds_probe_budget() {
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
@@ -8801,6 +9014,41 @@ mod tests {
         assert!(!conns.contains_key("conn:session:tab-1"));
         assert!(!conns.contains_key("conn:analytics:session:tab-1"));
         assert!(conns.contains_key("other"));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The plan Host API gates on this, so it has to be exactly "DBX holds a pool
+    /// for this connection": no pool means closed, and the read must not create
+    /// the pool it is checking for.
+    #[tokio::test]
+    async fn connection_is_open_only_while_one_of_its_pools_exists() {
+        let (state, dir) = test_app_state().await;
+        let pool = crate::db::sqlite::connect_path(":memory:").await.unwrap();
+
+        assert!(!state.is_connection_open("conn").await);
+        assert!(state.with_connection_pools(|pools| pools.is_empty()).await, "the check must not create a pool");
+
+        for pool_key in ["conn", "conn:analytics", "conn:analytics:catalog:app", "conn:analytics:session:tab-1"] {
+            state.update_connection_pools(|connections| connections.clear()).await;
+            state
+                .update_connection_pools(|connections| {
+                    connections.insert(pool_key.to_string(), PoolKind::Sqlite(pool.clone()))
+                })
+                .await;
+            assert!(state.is_connection_open("conn").await, "{pool_key} belongs to conn");
+        }
+
+        // A sibling id that merely starts with the same characters is another
+        // connection, and draining one must not report the other as open.
+        state.update_connection_pools(|connections| connections.clear()).await;
+        state
+            .update_connection_pools(|connections| {
+                connections.insert("conn-2:analytics".to_string(), PoolKind::Sqlite(pool))
+            })
+            .await;
+        assert!(!state.is_connection_open("conn").await);
+        assert!(state.is_connection_open("conn-2").await);
 
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -9733,10 +9981,15 @@ for line in sys.stdin:
         let pool = crate::db::sqlite::connect_path(":memory:").await.unwrap();
         state.connections.write().await.insert(pool_key.to_string(), PoolKind::Sqlite(pool));
         state.pool_activity.write().await.insert(pool_key.to_string(), super::PoolActivity::now());
+        // A tab that kept a user transaction and was then detached: the marker
+        // must not outlive the pool, otherwise rebuilding the same pool key
+        // would look like "already preserved".
+        state.mark_preserved_explicit_transaction(pool_key).await;
 
         assert!(state.detach_pool_by_key(pool_key, false).await);
         assert!(!state.connections.read().await.contains_key(pool_key));
         assert!(!state.pool_activity.read().await.contains_key(pool_key));
+        assert!(!state.has_preserved_explicit_transaction(pool_key).await);
 
         for _ in 0..100 {
             if state.supervised_task_count() == 0 {

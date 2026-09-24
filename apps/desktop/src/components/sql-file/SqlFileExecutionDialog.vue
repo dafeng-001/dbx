@@ -62,6 +62,7 @@ watch(previews, (list) => {
 const activePreview = computed<SqlFilePreview | null>(() => {
   return previews.value.find((item) => item.filePath === activePreviewPath.value) ?? previews.value[0] ?? null;
 });
+const activePreviewHtml = computed(() => (activePreview.value ? highlight(activePreview.value.preview) : ""));
 
 // Disambiguate files that share the same fileName.
 // Desktop: prepend parent directory segments until unique (e.g. migration/create.sql).
@@ -167,7 +168,7 @@ function resetPerFileState() {
   currentFileName.value = "";
 }
 
-const sqlConnections = computed(() => store.connections.filter((c) => !["redis", "mongodb", "elasticsearch", "easysearch", "meilisearch", "qdrant", "milvus", "weaviate", "chromadb", "etcd", "zookeeper", "consul", "mq", "nacos"].includes(c.db_type)));
+const sqlConnections = computed(() => store.connections.filter((c) => !["redis", "mongodb", "elasticsearch", "easysearch", "meilisearch", "solr", "qdrant", "milvus", "weaviate", "chromadb", "etcd", "zookeeper", "consul", "mq", "nacos"].includes(c.db_type)));
 // Mirrors the core executor gate (`relational_constraint_bypass_kind` in
 // sql_file_import.rs): MySQL-family types use the session-scoped
 // FOREIGN_KEY_CHECKS toggle, PostgreSQL-family types use DISABLE/ENABLE
@@ -847,7 +848,7 @@ watch(
                 <div class="sticky left-0 z-10 select-none border-r bg-background/95 px-2 py-3 text-right font-mono leading-5 text-muted-foreground/70">
                   <div v-for="n in previewLineCount(activePreview)" :key="n">{{ n }}</div>
                 </div>
-                <pre class="min-w-max flex-1 p-3 font-mono leading-5 whitespace-pre" v-html="highlight(activePreview.preview)"></pre>
+                <pre class="min-w-max flex-1 p-3 font-mono leading-5 whitespace-pre" v-html="activePreviewHtml"></pre>
               </div>
             </div>
           </div>

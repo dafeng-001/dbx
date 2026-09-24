@@ -3277,6 +3277,19 @@ fn oracle_char_length_params(params: &str) -> String {
     format!("({digits} CHAR)")
 }
 
+/// Text-ish source types resolve here. Oracle-syntax-family targets (Oracle,
+/// OceanBase Oracle mode, Dameng) have no `TEXT` data type — large character
+/// values live in `CLOB` — so emitting `TEXT` there makes the generated
+/// `CREATE TABLE` invalid (`ORA-00902: invalid datatype`, OceanBase
+/// `OBE-00900`). `table_import`'s `text_data_type` already maps Oracle-family
+/// targets to `CLOB` for file imports; the transfer path did not (#9886).
+fn target_text_type(target_db: &DatabaseType) -> &'static str {
+    match target_db {
+        DatabaseType::Oracle | DatabaseType::OceanbaseOracle | DatabaseType::Dameng => "CLOB",
+        _ => "TEXT",
+    }
+}
+
 pub fn map_column_type(source_type: &str, source_db: &DatabaseType, target_db: &DatabaseType) -> String {
     if source_db == target_db {
         return source_type.to_string();
@@ -3354,13 +3367,22 @@ pub fn map_column_type(source_type: &str, source_db: &DatabaseType, target_db: &
         },
         "decimal" | "numeric" | "number" => {
             if t.contains('(') {
+                let params = &t[t.find('(').unwrap()..];
                 match target_db {
-                    DatabaseType::Mysql | DatabaseType::SqlServer | DatabaseType::Oracle | DatabaseType::H2 => {
-                        format!("DECIMAL{}", &t[t.find('(').unwrap()..])
-                    }
-                    target_db if is_postgres_transfer_dialect(target_db) => {
-                        format!("DECIMAL{}", &t[t.find('(').unwrap()..])
-                    }
+                    // Oracle-family targets accept DECIMAL(p, s) as a synonym for
+                    // NUMBER(p, s). OceanBase's Oracle mode and Dameng used to fall into
+                    // the bare-NUMERIC fallback below, which is NUMBER(38, 0): transferring
+                    // Oracle NUMBER(14, 2) silently dropped every decimal (#9667).
+                    DatabaseType::Mysql
+                    | DatabaseType::SqlServer
+                    | DatabaseType::Oracle
+                    | DatabaseType::OceanbaseOracle
+                    | DatabaseType::Dameng
+                    | DatabaseType::H2 => format!("DECIMAL{params}"),
+                    target_db if is_postgres_transfer_dialect(target_db) => format!("DECIMAL{params}"),
+                    // Every other target keeps the historical bare spelling: its decimal
+                    // semantics are not the Oracle NUMBER synonym, so passing (p, s) through
+                    // needs per-engine verification and stays out of scope here.
                     _ => "NUMERIC".into(),
                 }
             } else {
@@ -3390,13 +3412,13 @@ pub fn map_column_type(source_type: &str, source_db: &DatabaseType, target_db: &
         }
         "longtext" => match target_db {
             DatabaseType::Mysql => "LONGTEXT".into(),
-            _ => "TEXT".into(),
+            _ => target_text_type(target_db).into(),
         },
         "mediumtext" => match target_db {
             DatabaseType::Mysql => "MEDIUMTEXT".into(),
-            _ => "TEXT".into(),
+            _ => target_text_type(target_db).into(),
         },
-        "text" | "tinytext" | "clob" | "ntext" => "TEXT".into(),
+        "text" | "tinytext" | "clob" | "ntext" => target_text_type(target_db).into(),
         "bool" | "boolean" => match target_db {
             DatabaseType::Mysql => "TINYINT(1)".into(),
             DatabaseType::SqlServer => "BIT".into(),
@@ -3441,7 +3463,7 @@ pub fn map_column_type(source_type: &str, source_db: &DatabaseType, target_db: &
         "json" | "jsonb" => match target_db {
             target_db if is_postgres_transfer_dialect(target_db) => "JSONB".into(),
             DatabaseType::Mysql => "JSON".into(),
-            _ => "TEXT".into(),
+            _ => target_text_type(target_db).into(),
         },
         "uuid" => match target_db {
             target_db if is_postgres_transfer_dialect(target_db) => "UUID".into(),
@@ -3451,7 +3473,7 @@ pub fn map_column_type(source_type: &str, source_db: &DatabaseType, target_db: &
             target_db if is_postgres_transfer_dialect(target_db) => "BOOLEAN".into(),
             _ => "BIT".into(),
         },
-        _ => "TEXT".into(),
+        _ => target_text_type(target_db).into(),
     }
 }
 
@@ -16331,6 +16353,139 @@ SELECT 1 FROM dual"#
         assert_eq!(map_column_type("VARCHAR2(50    CHAR)", &DatabaseType::Oracle, &DatabaseType::Mysql), "VARCHAR(50)");
         // NVARCHAR2 keeps its pre-existing fallback (TEXT) — no length unit leaks.
         assert_eq!(map_column_type("NVARCHAR2(50 CHAR)", &DatabaseType::Oracle, &DatabaseType::Mysql), "TEXT");
+    }
+
+    #[test]
+    fn map_column_type_keeps_number_precision_for_oracle_family_targets() {
+        // Issue #9667: transferring an Oracle table to OceanBase(Oracle mode) generated a
+        // bare `NUMERIC` for every NUMBER(p, s) column. In Oracle-compatible semantics that
+        // is NUMBER(38, 0), so the target silently dropped every decimal (only the integer
+        // part survived). Oracle-family targets must keep precision and scale.
+        for target in [DatabaseType::OceanbaseOracle, DatabaseType::Dameng] {
+            assert_eq!(map_column_type("NUMBER(14,2)", &DatabaseType::Oracle, &target), "DECIMAL(14,2)");
+            assert_eq!(map_column_type("NUMBER(14,10)", &DatabaseType::Oracle, &target), "DECIMAL(14,10)");
+            assert_eq!(map_column_type("NUMBER(15,0)", &DatabaseType::Oracle, &target), "DECIMAL(15,0)");
+            assert_eq!(map_column_type("NUMBER(12,4)", &DatabaseType::Oracle, &target), "DECIMAL(12,4)");
+            assert_eq!(map_column_type("NUMBER(10,-2)", &DatabaseType::Oracle, &target), "DECIMAL(10,-2)");
+            // Spacing inside the parameter list is preserved verbatim, exactly like the
+            // existing Mysql/H2/Oracle branches.
+            assert_eq!(map_column_type("NUMBER(14, 2)", &DatabaseType::Oracle, &target), "DECIMAL(14, 2)");
+        }
+
+        // A source type without parameters keeps the historical bare spelling: it carries
+        // no precision to lose.
+        assert_eq!(map_column_type("NUMBER", &DatabaseType::Oracle, &DatabaseType::OceanbaseOracle), "NUMERIC");
+        assert_eq!(map_column_type("NUMBER", &DatabaseType::Oracle, &DatabaseType::Dameng), "NUMERIC");
+    }
+
+    #[test]
+    fn transfer_create_table_oracle_to_oceanbase_oracle_keeps_number_scale() {
+        let columns = vec![
+            db::ColumnInfo { is_primary_key: true, ..test_column("ID", "NUMBER(10)") },
+            test_column("SUMZEROTAXPREMIUM", "NUMBER(14,2)"),
+            test_column("XBCOMPANYRATE", "NUMBER(14,10)"),
+            test_column("PLAINNUMBER", "NUMBER"),
+        ];
+
+        let ddl = generate_create_table_ddl(
+            &columns,
+            "TXF_PREC",
+            "DBX_TEST",
+            "DBX_TEST",
+            &DatabaseType::OceanbaseOracle,
+            &DatabaseType::Oracle,
+            None,
+            None,
+        );
+
+        assert!(ddl.contains("\"SUMZEROTAXPREMIUM\" DECIMAL(14,2)"), "{ddl}");
+        assert!(ddl.contains("\"XBCOMPANYRATE\" DECIMAL(14,10)"), "{ddl}");
+        assert!(ddl.contains("\"ID\" DECIMAL(10)"), "{ddl}");
+        assert!(ddl.contains("\"PLAINNUMBER\" NUMERIC"), "{ddl}");
+    }
+
+    #[test]
+    fn map_column_type_uses_clob_for_oracle_family_text_types() {
+        // Issue #9886: an Oracle 19c table transferred to OceanBase 4.4(Oracle mode) failed
+        // with `OBE-00900` because every text-ish column was emitted as `TEXT`. Oracle syntax
+        // has no `TEXT` data type — the large-character type is `CLOB` — so Oracle-family
+        // targets must map text here exactly like `table_import`'s `text_data_type` does.
+        for target in [DatabaseType::OceanbaseOracle, DatabaseType::Dameng] {
+            // Oracle source: CLOB survives the hop to the Oracle-family target.
+            assert_eq!(map_column_type("CLOB", &DatabaseType::Oracle, &target), "CLOB");
+            assert_eq!(map_column_type("clob", &DatabaseType::Oracle, &target), "CLOB");
+            // Every text-ish source type funnels into the same target spelling.
+            assert_eq!(map_column_type("TEXT", &DatabaseType::Mysql, &target), "CLOB");
+            assert_eq!(map_column_type("tinytext", &DatabaseType::Mysql, &target), "CLOB");
+            assert_eq!(map_column_type("longtext", &DatabaseType::Mysql, &target), "CLOB");
+            assert_eq!(map_column_type("mediumtext", &DatabaseType::Mysql, &target), "CLOB");
+            assert_eq!(map_column_type("text", &DatabaseType::Postgres, &target), "CLOB");
+            assert_eq!(map_column_type("ntext", &DatabaseType::SqlServer, &target), "CLOB");
+            assert_eq!(map_column_type("json", &DatabaseType::Mysql, &target), "CLOB");
+            // Unrecognised source types fall back to the large-character type instead of an
+            // `TEXT` spelling the target rejects outright.
+            assert_eq!(map_column_type("geometry", &DatabaseType::Mysql, &target), "CLOB");
+        }
+
+        // A plain Oracle target behaves identically.
+        assert_eq!(map_column_type("CLOB", &DatabaseType::OceanbaseOracle, &DatabaseType::Oracle), "CLOB");
+        assert_eq!(map_column_type("TEXT", &DatabaseType::Mysql, &DatabaseType::Oracle), "CLOB");
+        assert_eq!(map_column_type("longtext", &DatabaseType::Mysql, &DatabaseType::Oracle), "CLOB");
+
+        // Non-Oracle-family targets keep their historical `TEXT` spelling.
+        assert_eq!(map_column_type("TEXT", &DatabaseType::Mysql, &DatabaseType::Postgres), "TEXT");
+        assert_eq!(map_column_type("CLOB", &DatabaseType::Oracle, &DatabaseType::Mysql), "TEXT");
+        assert_eq!(map_column_type("ntext", &DatabaseType::SqlServer, &DatabaseType::Sqlite), "TEXT");
+        assert_eq!(map_column_type("geometry", &DatabaseType::Mysql, &DatabaseType::Sqlite), "TEXT");
+    }
+
+    #[test]
+    fn transfer_create_table_oracle_to_oceanbase_oracle_uses_clob_for_text_columns() {
+        let columns = vec![
+            db::ColumnInfo { is_primary_key: true, ..test_column("ID", "NUMBER(10)") },
+            test_column("RESPONSEXML", "CLOB"),
+            test_column("REMARK", "VARCHAR2(100 BYTE)"),
+        ];
+
+        let ddl = generate_create_table_ddl(
+            &columns,
+            "T_CLOB_PROBE",
+            "DBX_TEST",
+            "DBX_TEST",
+            &DatabaseType::OceanbaseOracle,
+            &DatabaseType::Oracle,
+            None,
+            None,
+        );
+
+        assert!(ddl.contains("\"RESPONSEXML\" CLOB"), "{ddl}");
+        assert!(!ddl.contains("TEXT"), "{ddl}");
+        // The byte length unit still travels between Oracle-family targets.
+        assert!(ddl.contains("\"REMARK\" VARCHAR(100 byte)"), "{ddl}");
+    }
+
+    #[test]
+    fn transfer_create_table_mysql_to_oracle_uses_clob_for_text_columns() {
+        let columns = vec![
+            db::ColumnInfo { is_primary_key: true, ..test_column("ID", "INT") },
+            test_column("RESPONSE_XML", "TEXT"),
+            test_column("PAYLOAD", "LONGTEXT"),
+        ];
+
+        let ddl = generate_create_table_ddl(
+            &columns,
+            "SRC_CLOB_PROBE",
+            "dbx",
+            "DBX_TEST",
+            &DatabaseType::Oracle,
+            &DatabaseType::Mysql,
+            None,
+            None,
+        );
+
+        assert!(ddl.contains("\"RESPONSE_XML\" CLOB"), "{ddl}");
+        assert!(ddl.contains("\"PAYLOAD\" CLOB"), "{ddl}");
+        assert!(!ddl.contains("TEXT"), "{ddl}");
     }
 
     #[test]

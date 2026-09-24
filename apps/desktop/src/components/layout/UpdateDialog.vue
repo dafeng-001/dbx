@@ -8,7 +8,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import type { UpdateInfo } from "@/lib/backend/api";
 import type { AgentDriverInfo, McpServerStatus, UpdateDownloadSource } from "@/lib/backend/tauri";
 import type { JdbcPluginStatus } from "@/types/database";
-import type { MarketplacePluginListing } from "@/lib/plugins/pluginMarketplace";
+import { pluginSourceChange, type MarketplacePluginListing } from "@/lib/plugins/pluginMarketplace";
 import { mcpUpdateAvailability } from "@/lib/mcp/mcpUpdateStatus";
 import { isTauriRuntime } from "@/lib/backend/tauriRuntime";
 import { isUpdatePreviewMockEnabled } from "@/lib/updates/updatePreviewMock";
@@ -83,7 +83,7 @@ const tabs = computed(() => {
   if (props.jdbcUpdate?.update_available) available.push({ id: "jdbc", label: t("settings.updateJdbc"), count: 1 });
   if (mcpAvailable.value) available.push({ id: "mcp", label: t("settings.updateMcp"), count: 1 });
   if (props.pluginUpdates.length) available.push({ id: "plugins", label: t("settings.updatePlugins"), count: props.pluginUpdates.length });
-  return available.length ? available : [{ id: "app" as const, label: t("settings.updateClient"), count: 0 }];
+  return available;
 });
 const totalUpdateCount = computed(() => tabs.value.reduce((total, tab) => total + tab.count, 0));
 const hasComponentUpdates = computed(() => props.driverUpdates.length > 0 || props.jdbcUpdate?.update_available === true || mcpAvailable.value || props.pluginUpdates.length > 0);
@@ -193,7 +193,7 @@ watch(
       </DialogHeader>
 
       <div class="flex min-h-0 flex-1 flex-col">
-        <div class="border-b px-4 py-2">
+        <div v-if="tabs.length" class="border-b px-4 py-2">
           <div role="tablist" :aria-label="t('updates.centerTitle')" class="inline-flex h-9 w-full items-center justify-center rounded-md bg-muted p-[3px] text-muted-foreground">
             <button
               v-for="tab in tabs"
@@ -302,6 +302,9 @@ watch(
                   <div class="min-w-0">
                     <div class="truncate font-medium">{{ plugin.name }}</div>
                     <div class="mt-0.5 text-xs text-muted-foreground">{{ plugin.installed?.manifest.version || t("updates.notInstalled") }} → {{ plugin.plugin.latestVersion }}</div>
+                    <!-- "Update all" deliberately skips a changed source: the user has to confirm it in
+                         the Plugin Center, so say so instead of leaving an item that never updates. -->
+                    <div v-if="pluginSourceChange(plugin)" class="mt-1 text-xs text-amber-600 dark:text-amber-400">{{ t("pluginPlatform.updateSourceChangeRequired") }}</div>
                   </div>
                   <span class="shrink-0 rounded-full bg-primary/10 px-2 py-0.5 text-xs font-medium text-primary">{{ t("settings.updateAvailable") }}</span>
                 </div>
