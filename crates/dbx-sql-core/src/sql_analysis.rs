@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 
 use regex::Regex;
@@ -148,10 +148,20 @@ struct Analyzer {
 pub fn analyze_sql_references(sql: &str, dialect: Option<&str>) -> Result<SqlReferenceAnalysis, String> {
     let normalized_dialect = normalize_dialect(dialect);
     if normalized_dialect == "duckdb" && starts_with_duckdb_parser_gap_sql(sql) {
-        return Ok(SqlReferenceAnalysis { tables: vec![], columns: vec![], scopes: vec![], group_by_violations: vec![] });
+        return Ok(SqlReferenceAnalysis {
+            tables: vec![],
+            columns: vec![],
+            scopes: vec![],
+            group_by_violations: vec![],
+        });
     }
     if normalized_dialect == "postgres" && starts_with_postgres_parser_gap_sql(sql) {
-        return Ok(SqlReferenceAnalysis { tables: vec![], columns: vec![], scopes: vec![], group_by_violations: vec![] });
+        return Ok(SqlReferenceAnalysis {
+            tables: vec![],
+            columns: vec![],
+            scopes: vec![],
+            group_by_violations: vec![],
+        });
     }
     let parser_sql = if normalized_dialect == "clickhouse" {
         normalize_clickhouse_join_order_for_parser(sql)
@@ -179,7 +189,12 @@ pub fn analyze_sql_references(sql: &str, dialect: Option<&str>) -> Result<SqlRef
         Err(error)
             if normalized_dialect == "postgres" && is_postgres_create_procedure_parser_gap(&parser_sql, &error) =>
         {
-            return Ok(SqlReferenceAnalysis { tables: vec![], columns: vec![], scopes: vec![], group_by_violations: vec![] });
+            return Ok(SqlReferenceAnalysis {
+                tables: vec![],
+                columns: vec![],
+                scopes: vec![],
+                group_by_violations: vec![],
+            });
         }
         Err(error) => match oracle_admin_ddl_gap_statements(dialect, &parser_sql) {
             Some(statements) => statements,
@@ -202,9 +217,11 @@ pub fn analyze_sql_references(sql: &str, dialect: Option<&str>) -> Result<SqlRef
         scopes: analyzer.scopes,
         group_by_violations: analyzer.group_by_violations,
     };
-    // Engines that do not enforce strict GROUP BY semantics (MySQL with
-    // ONLY_FULL_GROUP_BY disabled, SQLite, DuckDB, ClickHouse, Spark) accept
-    // ungrouped projection columns, so flagging them would be noise.
+    // Engines that do not enforce strict GROUP BY semantics (MySQL, SQLite,
+    // DuckDB, ClickHouse, Spark) accept ungrouped projection columns — MySQL
+    // enforces ONLY_FULL_GROUP_BY by default since 5.7 but the frontend has no
+    // access to the connection's sql_mode, so skipping is the conservative
+    // choice — flagging them there would be noise.
     if matches!(normalized_dialect.as_str(), "mysql" | "sqlite" | "duckdb" | "clickhouse" | "spark") {
         analysis.group_by_violations.clear();
     }
@@ -1253,7 +1270,9 @@ impl Analyzer {
         for item in &select.projection {
             match item {
                 SelectItem::UnnamedExpr(expr) => self.visit_projection_item(expr, None),
-                SelectItem::ExprWithAlias { expr, alias } => self.visit_projection_item(expr, Some(alias.value.clone())),
+                SelectItem::ExprWithAlias { expr, alias } => {
+                    self.visit_projection_item(expr, Some(alias.value.clone()))
+                }
                 SelectItem::ExprWithAliases { expr, .. } => self.visit_projection_item(expr, None),
                 _ => {}
             }
@@ -1271,7 +1290,11 @@ impl Analyzer {
                 match plain_identifier_parts(expr) {
                     Some((qualifier, name)) => {
                         if let Some(qualifier) = qualifier {
-                            group_by_context.qualified.insert(format!("{}.{}", qualifier.to_ascii_lowercase(), name.to_ascii_lowercase()));
+                            group_by_context.qualified.insert(format!(
+                                "{}.{}",
+                                qualifier.to_ascii_lowercase(),
+                                name.to_ascii_lowercase()
+                            ));
                         } else {
                             group_by_context.bare.insert(name.to_ascii_lowercase());
                         }
@@ -1309,10 +1332,7 @@ impl Analyzer {
     }
 
     fn visit_projection_item(&mut self, expr: &Expr, alias: Option<String>) {
-        self.current_projection_item = Some(ProjectionItemAcc {
-            alias,
-            ..ProjectionItemAcc::default()
-        });
+        self.current_projection_item = Some(ProjectionItemAcc { alias, ..ProjectionItemAcc::default() });
         self.visit_expr(expr);
         if let Some(item) = self.current_projection_item.take() {
             self.projection_items.push(item);
@@ -1342,9 +1362,35 @@ impl Analyzer {
                 alias_grouped_columns.insert(column.name.to_ascii_lowercase());
             }
         }
+        // Qualifier asymmetry: `u.name` in the projection and `users.name` in
+        // GROUP BY refer to the same table when one side is the other's alias,
+        // so normalize every qualifier to the underlying table name before
+        // comparing.
+        let qualifier_table_names: HashMap<String, String> = self
+            .tables
+            .iter()
+            .filter_map(|table| {
+                table.alias.as_ref().map(|alias| (alias.to_ascii_lowercase(), table.name.to_ascii_lowercase()))
+            })
+            .collect();
+        let normalize_qualifier = |qualifier: &str| -> String {
+            qualifier_table_names
+                .get(&qualifier.to_ascii_lowercase())
+                .cloned()
+                .unwrap_or_else(|| qualifier.to_ascii_lowercase())
+        };
+        let grouped_qualified: HashSet<String> = context
+            .qualified
+            .iter()
+            .map(|entry| match entry.split_once('.') {
+                Some((qualifier, name)) => format!("{}.{}", normalize_qualifier(qualifier), name),
+                None => entry.clone(),
+            })
+            .collect();
         let mut violations: Vec<SqlGroupByViolation> = Vec::new();
         for item in &self.projection_items {
-            let item_alias_grouped = item.alias.as_ref().map(|alias| context.bare.contains(&alias.to_ascii_lowercase())).unwrap_or(false);
+            let item_alias_grouped =
+                item.alias.as_ref().map(|alias| context.bare.contains(&alias.to_ascii_lowercase())).unwrap_or(false);
             for column in &item.columns {
                 if column.aggregated || item_alias_grouped {
                     continue;
@@ -1354,7 +1400,7 @@ impl Analyzer {
                     continue;
                 }
                 if let Some(qualifier) = &column.qualifier {
-                    if context.qualified.contains(&format!("{}.{}", qualifier.to_ascii_lowercase(), name)) {
+                    if grouped_qualified.contains(&format!("{}.{}", normalize_qualifier(qualifier), name)) {
                         continue;
                     }
                 }
@@ -1519,7 +1565,8 @@ impl Analyzer {
             Expr::Function(function) => {
                 // Columns wrapped in an aggregate call or a window function are
                 // exempt from the GROUP BY membership check.
-                let function_name = object_name_last_ident(&function.name).map(|ident| ident.value.to_ascii_lowercase());
+                let function_name =
+                    object_name_last_ident(&function.name).map(|ident| ident.value.to_ascii_lowercase());
                 let is_aggregate = function_name.as_deref().map(is_aggregate_function_name).unwrap_or(false);
                 let has_window = function.over.is_some();
                 if is_aggregate {
@@ -1640,11 +1687,8 @@ fn plain_identifier_parts(expr: &Expr) -> Option<(Option<String>, String)> {
         Expr::Identifier(ident) => Some((None, ident.value.clone())),
         Expr::CompoundIdentifier(idents) => {
             let column = idents.last()?;
-            let qualifier = if idents.len() >= 2 {
-                idents.get(idents.len() - 2).map(|ident| ident.value.clone())
-            } else {
-                None
-            };
+            let qualifier =
+                if idents.len() >= 2 { idents.get(idents.len() - 2).map(|ident| ident.value.clone()) } else { None };
             Some((qualifier, column.value.clone()))
         }
         _ => None,
@@ -1848,6 +1892,19 @@ mod group_by_violation_tests {
         assert_eq!(result[0].column, "name");
         assert_eq!(result[0].qualifier.as_deref(), Some("u"));
         assert!(violations("SELECT u.id, u.name FROM users u GROUP BY u.id, u.name", None).is_empty());
+    }
+
+    #[test]
+    fn qualifier_asymmetry_resolves_alias_and_table_name() {
+        // Projection qualifier (alias) vs GROUP BY qualifier (table name) refers
+        // to the same table, so the grouped column itself must pass...
+        assert!(violations("SELECT u.id FROM users u GROUP BY users.id", None).is_empty());
+        // ...and the reverse direction.
+        assert!(violations("SELECT users.id FROM users u GROUP BY u.id", None).is_empty());
+        // Columns that are genuinely ungrouped stay flagged under either spelling.
+        let result = violations("SELECT u.id, u.name FROM users u GROUP BY users.id", None);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].column, "name");
     }
 
     #[test]

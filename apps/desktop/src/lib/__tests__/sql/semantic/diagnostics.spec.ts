@@ -29,6 +29,19 @@ describe("buildSqlSemanticDiagnostics GROUP BY violations", () => {
     ]);
   });
 
+  it("downgrades the severity to warning on PostgreSQL", () => {
+    const analysis: SqlReferenceAnalysis = {
+      tables: [],
+      columns: [],
+      group_by_violations: [{ span: span(8, 15), column: "name", qualifier: "u" }],
+    };
+
+    const diagnostics = buildSqlSemanticDiagnostics(analysis, { tables: [], columnsByTable: new Map(), databaseType: "postgres" });
+
+    expect(diagnostics).toHaveLength(1);
+    expect(diagnostics[0]?.severity).toBe("warning");
+  });
+
   it("includes the qualifier in the message and tolerates missing sql", () => {
     const analysis: SqlReferenceAnalysis = {
       tables: [],
